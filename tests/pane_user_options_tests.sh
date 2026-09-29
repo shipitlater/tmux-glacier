@@ -246,11 +246,17 @@ EOF
 }
 
 freeze_test_cleanup() {
-  tmux kill-server 2>/dev/null || true
-  rm -rf "$freeze_test_dir"
-  PATH="$freeze_test_original_path"
-  export PATH
-  unset GLACIER_FAIL_MODE
+  if [ -n "${GLACIER_TEST_SOCKET:-}" ] && [ -S "$GLACIER_TEST_SOCKET" ] && [ -n "${GLACIER_REAL_TMUX:-}" ]; then
+    "$GLACIER_REAL_TMUX" -S "$GLACIER_TEST_SOCKET" kill-server 2>/dev/null || true
+  fi
+  if [ -n "${freeze_test_dir:-}" ]; then
+    rm -rf "$freeze_test_dir"
+  fi
+  if [ -n "${freeze_test_original_path:-}" ]; then
+    PATH="$freeze_test_original_path"
+    export PATH
+  fi
+  unset GLACIER_FAIL_MODE GLACIER_REAL_TMUX GLACIER_REAL_BASE64 GLACIER_TEST_SOCKET GLACIER_TEST_DIR freeze_test_dir freeze_test_original_path
 }
 
 run_real_freeze() {
@@ -316,13 +322,23 @@ test_freeze_failure_keeps_last() {
   freeze_test_cleanup
 }
 
+run_freeze_test() {
+  local description="$1"
+  shift
+  if ! "$@"; then
+    failed=$((failed + 1))
+    printf '실패: %s 준비 또는 실행\n' "$description" >&2
+    freeze_test_cleanup
+  fi
+}
+
 test_codec_bytes
 test_decoder_portability
 test_capture_failure
 test_argument_and_names
 test_real_tmux_names
-test_freeze_records
-test_freeze_scope
-test_freeze_failure_keeps_last
+run_freeze_test 'Freeze 레코드' test_freeze_records
+run_freeze_test 'Freeze 범위' test_freeze_scope
+run_freeze_test 'Freeze 실패 보존' test_freeze_failure_keeps_last
 printf '결과: %s개 통과, %s개 실패\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]
