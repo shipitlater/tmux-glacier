@@ -150,6 +150,134 @@ restore_all_panes() {
 	fi
 }
 
+# 빈 필드까지 보존해 검증한 뒤 pane-local user option을 pane 단위로 교체한다.
+restore_pane_user_options() {
+	local save_file="$1" line remainder line_type key target pane_id inventory
+	local name value names encoded_name escaped_target escaped_name escaped_value
+	local i j count field_count line_number=0 result=0 valid
+	local current_session current_window current_pane current_id
+	local -a fields keys markers corrupt owners saved_names saved_values current_names
+	keys=() markers=() corrupt=() owners=() saved_names=() saved_values=()
+
+	while IFS= read -r line || [ -n "$line" ]; do
+		line_number=$((line_number + 1))
+		line_type="${line%%$'\t'*}"
+		case "$line_type" in pane_user_options|pane_user_option) ;; *) continue ;; esac
+
+		# IFS 공백 병합이나 별도 구분 문자 치환 없이 실제 탭만 분리한다.
+		fields=()
+		remainder="$line"
+		while [[ "$remainder" == *$'\t'* ]]; do
+			fields[${#fields[@]}]="${remainder%%$'\t'*}"
+			remainder="${remainder#*$'\t'}"
+		done
+		fields[${#fields[@]}]="$remainder"
+		field_count=${#fields[@]}
+		valid=true
+		[ -n "${fields[1]:-}" ] || valid=false
+		case "${fields[2]:-}" in ''|*[!0-9]*) valid=false ;; esac
+		case "${fields[3]:-}" in ''|*[!0-9]*) valid=false ;; esac
+		if [ "$valid" = false ]; then
+			frost_log ERROR "pane 옵션 복원: ${line_number}행 식별자 오류"
+			result=1
+			continue
+		fi
+
+		key="${fields[1]}${d}${fields[2]}${d}${fields[3]}"
+		count=${#keys[@]}
+		for ((i = 0; i < count; i++)); do
+			[ "${keys[i]}" = "$key" ] && break
+		done
+		if [ "$i" -eq "$count" ]; then
+			keys[i]="$key" markers[i]=false corrupt[i]=false
+		fi
+		target="${fields[1]}:${fields[2]}.${fields[3]}"
+		if [ "$line_type" = pane_user_options ] && [ "$field_count" -eq 4 ]; then
+			markers[i]=true
+		elif [ "$line_type" = pane_user_option ] && [ "$field_count" -eq 6 ] &&
+			decode_option_field "${fields[4]}" name && [[ "$name" == @* ]] &&
+			decode_option_field "${fields[5]}" value; then
+			j=${#owners[@]}
+			owners[j]="$i" saved_names[j]="$name" saved_values[j]="$value"
+		else
+			corrupt[i]=true
+			result=1
+			frost_log ERROR "pane 옵션 복원: ${target} 레코드 검증 실패 (${line_number}행)"
+		fi
+	done < "$save_file"
+
+	[ "${#keys[@]}" -gt 0 ] || return "$result"
+	# tmux target의 접두사·현재 pane 해석을 피하고 정확한 식별자만 pane_id에 연결한다.
+	if ! inventory="$(tmux -u list-panes -a -F "#{session_name}${d}#{window_index}${d}#{pane_index}${d}#{pane_id}" 2>/dev/null)"; then
+		frost_log ERROR 'pane 옵션 복원: 대상 pane 목록 조회 실패'
+		return 1
+	fi
+	for ((i = 0; i < ${#keys[@]}; i++)); do
+		IFS=$'\t' read -r current_session current_window current_pane <<<"${keys[i]}"
+		target="${current_session}:${current_window}.${current_pane}"
+		if [ "${markers[i]}" = false ]; then
+			frost_log WARN "pane 옵션 복원: ${target} 유효한 마커 없는 레코드 무시"
+			result=1
+			continue
+		fi
+		[ "${corrupt[i]}" = false ] || continue
+		pane_id=''
+		while IFS=$'\t' read -r current_session current_window current_pane current_id; do
+			if [ "${current_session}${d}${current_window}${d}${current_pane}" = "${keys[i]}" ]; then
+				pane_id="$current_id"
+				break
+			fi
+		done <<<"$inventory"
+		if [ -z "$pane_id" ]; then
+			frost_log ERROR "pane 옵션 복원: ${target} 대상 pane 없음"
+			result=1
+			continue
+		fi
+		if ! names="$(list_pane_user_option_names "$pane_id" 2>/dev/null)"; then
+			frost_log ERROR "pane 옵션 복원: ${target} local 이름 조회 실패"
+			result=1
+			continue
+		fi
+		current_names=()
+		valid=true
+		while IFS= read -r encoded_name; do
+			[ -n "$encoded_name" ] || continue
+			if ! decode_option_field "$encoded_name" name; then
+				valid=false
+				break
+			fi
+			current_names[${#current_names[@]}]="$name"
+		done <<<"$names"
+		if [ "$valid" = false ]; then
+			frost_log ERROR "pane 옵션 복원: ${target} local 이름 디코딩 실패"
+			result=1
+			continue
+		fi
+
+		escape_tmux_argument "$pane_id" escaped_target
+		for name in "${current_names[@]}"; do
+			prepare_tmux_option_name "$name" escaped_name
+			if ! tmux -u set-option -up -t "$escaped_target" "$escaped_name" 2>/dev/null; then
+				frost_log ERROR "pane 옵션 복원: ${target} local 옵션 삭제 실패"
+				result=1
+				valid=false
+				break
+			fi
+		done
+		[ "$valid" = true ] || continue
+		for ((j = 0; j < ${#owners[@]}; j++)); do
+			[ "${owners[j]}" = "$i" ] || continue
+			prepare_tmux_option_name "${saved_names[j]}" escaped_name
+			escape_tmux_argument "${saved_values[j]}" escaped_value
+			if ! tmux -u set-option -p -t "$escaped_target" "$escaped_name" "$escaped_value" 2>/dev/null; then
+				frost_log ERROR "pane 옵션 복원: ${target} 저장 옵션 설정 실패"
+				result=1
+			fi
+		done
+	done
+	return "$result"
+}
+
 restore_window_properties() {
 	local save_file="$1"
 	# shellcheck disable=SC2034  # window_flags is a positional field, not used directly
@@ -244,11 +372,19 @@ main() {
 
 	display_message "Glacier: restoring..."
 
+	local option_status=0
 	restore_all_panes "$actual_file"
+	restore_pane_user_options "$actual_file" || option_status=1
 	restore_window_properties "$actual_file"
 	restore_active_panes "$actual_file"
 	restore_active_windows "$actual_file"
 	restore_state "$actual_file"
+
+	if [ "$option_status" -ne 0 ]; then
+		frost_log ERROR 'thaw 부분 복원: 일부 pane 옵션을 복원하지 못함'
+		display_message 'Glacier: 일부 pane 옵션 복원 실패, 로그를 확인하세요'
+		return 1
+	fi
 
 	local sessions panes
 	sessions="$(tmux list-sessions 2>/dev/null | wc -l | tr -d ' ')"

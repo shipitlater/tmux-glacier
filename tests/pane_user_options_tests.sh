@@ -210,6 +210,26 @@ case "${GLACIER_FAIL_MODE:-}" in
   query) case " $* " in *' show-options -pv '*) exit 37 ;; esac ;;
   dump) case " $* " in *' list-panes -a '*) exit 38 ;; esac ;;
 esac
+if [ "${1:-}" = -u ] && [ "${2:-}" = show-options ] && [ "${3:-}" = -p ] && [ "$#" -eq 5 ] && [ "${5:-}" = "${GLACIER_FAIL_PANE:-}" ] && [ "${GLACIER_FAIL_MODE:-}" = thaw-list ]; then
+  printf '@부분 값\n'
+  exit 40
+fi
+if [ "${1:-}" = -u ] && [ "${2:-}" = set-option ]; then
+  case "${3:-}" in
+    -up|-p)
+      if [ -n "${GLACIER_TRACE:-}" ]; then
+        printf '%s\t%s\t%s\n' "$3" "$5" "$6" >>"$GLACIER_TRACE"
+      fi
+      if [ "${5:-}" = "${GLACIER_FAIL_PANE:-}" ]; then
+        case "${GLACIER_FAIL_MODE:-}:$3:${6:-}" in
+          thaw-unset:-up:*) printf '노출금지진단\n' >&2; exit 41 ;;
+          thaw-set:-p:@foo) [ "${7:-}" != B ] || exit 43 ;;
+          thaw-set:-p:@fail) printf '노출금지진단\n' >&2; exit 42 ;;
+        esac
+      fi
+      ;;
+  esac
+fi
 exec "$GLACIER_REAL_TMUX" -S "$GLACIER_TEST_SOCKET" "$@"
 EOF
   cat >"$freeze_test_dir/bin/base64" <<'EOF'
@@ -256,7 +276,7 @@ freeze_test_cleanup() {
     PATH="$freeze_test_original_path"
     export PATH
   fi
-  unset GLACIER_FAIL_MODE GLACIER_REAL_TMUX GLACIER_REAL_BASE64 GLACIER_TEST_SOCKET GLACIER_TEST_DIR freeze_test_dir freeze_test_original_path
+  unset GLACIER_TRACE GLACIER_FAIL_PANE GLACIER_FAIL_MODE GLACIER_REAL_TMUX GLACIER_REAL_BASE64 GLACIER_TEST_SOCKET GLACIER_TEST_DIR freeze_test_dir freeze_test_original_path
 }
 
 run_real_freeze() {
@@ -332,13 +352,252 @@ run_freeze_test() {
   fi
 }
 
-test_codec_bytes
-test_decoder_portability
-test_capture_failure
-test_argument_and_names
-test_real_tmux_names
-run_freeze_test 'Freeze 레코드' test_freeze_records
-run_freeze_test 'Freeze 범위' test_freeze_scope
-run_freeze_test 'Freeze 실패 보존' test_freeze_failure_keeps_last
+run_real_thaw() {
+  /bin/bash "$SCRIPT_DIR/../scripts/thaw.sh" >"$freeze_test_dir/thaw-output" 2>&1
+}
+
+write_thaw_snapshot() {
+  printf 'frost_version\t1\n' >"$freeze_test_dir/saves/manual.txt" || return 1
+  cat >>"$freeze_test_dir/saves/manual.txt" || return 1
+  ln -sf manual.txt "$freeze_test_dir/saves/last"
+}
+
+pane_value_is() {
+  local actual
+  capture_option_value "$1" "$2" actual && [ "$actual" = "$3" ]
+}
+
+pane_option_absent() {
+  local actual
+  ! capture_option_value "$1" "$2" actual 2>/dev/null
+}
+
+test_replace_and_empty_marker() {
+  freeze_test_setup || return 1
+  local first second
+  first="$(tmux list-panes -t freeze-options -F '#{pane_id}')" || return 1
+  second="$(tmux split-window -d -P -F '#{pane_id}' -t "$first" 'sleep 60')" || return 1
+  tmux -u set-option -p -t "$first" '@foo' A || return 1
+  tmux -u set-option -g '@global-only' global || return 1
+  tmux -u set-option -w -t freeze-options:0 '@window-only' window || return 1
+  tmux -u set-option -p -t "$first" remain-on-exit on || return 1
+  run_real_freeze || return 1
+  tmux -u set-option -p -t "$first" '@foo' OLD || return 1
+  tmux -u set-option -p -t "$first" '@bar' B || return 1
+  tmux -u set-option -p -t "$second" '@stale' C || return 1
+  check '실제 Thaw 교체 성공' run_real_thaw
+  check '@foo 스냅샷 값 복원' pane_value_is "$first" '@foo' A
+  check 'stale @bar 제거' pane_option_absent "$first" '@bar'
+  check '빈 마커의 local 전체 제거' pane_option_absent "$second" '@stale'
+  check 'built-in 보존' test "$(tmux show-options -pv -t "$first" remain-on-exit)" = on
+  check 'global 보존' test "$(tmux show-options -gv '@global-only')" = global
+  check 'window 보존' test "$(tmux show-options -wv -t freeze-options:0 '@window-only')" = window
+  tmux -u set-option -p -t "$first" '@bar' again || return 1
+  check '반복 Thaw 성공' run_real_thaw
+  check '반복 Thaw도 stale 제거' pane_option_absent "$first" '@bar'
+  check '반복 Thaw pane 수 보존' test "$(tmux list-panes -t freeze-options | wc -l | tr -d ' ')" -eq 2
+  freeze_test_cleanup
+}
+
+test_legacy_and_orphan() {
+  freeze_test_setup || return 1
+  local first
+  first="$(tmux list-panes -t freeze-options -F '#{pane_id}')" || return 1
+  tmux -u set-option -p -t "$first" '@foo' OLD || return 1
+  write_thaw_snapshot </dev/null || return 1
+  check '구형 스냅샷 Thaw 성공' run_real_thaw
+  check '구형 스냅샷 local 보존' pane_value_is "$first" '@foo' OLD
+  printf 'pane_user_option\tfreeze-options\t0\t0\tb64:QGZvbw==\tb64:QQ==\n' | write_thaw_snapshot || return 1
+  run_real_thaw || true
+  check 'orphan 옵션 무시' pane_value_is "$first" '@foo' OLD
+  check 'orphan 로그 기록' grep -q '마커' "$freeze_test_dir/saves/"*.log
+  freeze_test_cleanup
+}
+
+test_corrupt_pane_isolation() {
+  freeze_test_setup || return 1
+  local first second record
+  first="$(tmux list-panes -t freeze-options -F '#{pane_id}')" || return 1
+  second="$(tmux split-window -d -P -F '#{pane_id}' -t "$first" 'sleep 60')" || return 1
+  GLACIER_TRACE="$freeze_test_dir/trace"
+  export GLACIER_TRACE
+  for record in \
+    $'pane_user_options\tfreeze-options\t0\t0\textra' \
+    $'pane_user_options\tfreeze-options\t0\t0\t' \
+    $'pane_user_option\tfreeze-options\t0\t0' \
+    $'pane_user_option\tfreeze-options\t0\t0\t\tb64:QQ==' \
+    $'pane_user_option\tfreeze-options\t0\t0\tb64:QGZvbw==\t' \
+    $'pane_user_option\tfreeze-options\t0\t0\tb64:QGZvbw==\tb64:QQ==\textra' \
+    $'pane_user_option\tfreeze-options\t0\t0\tb64:QGZvbw==\tb64:QQ==\t' \
+    $'pane_user_option\tfreeze-options\t0\t0\tQGZvbw==\tb64:QQ==' \
+    $'pane_user_option\tfreeze-options\t0\t0\tb64:QGZvbw==\tQQ==' \
+    $'pane_user_option\tfreeze-options\t0\t0\tb64:***\tb64:QQ==' \
+    $'pane_user_option\tfreeze-options\t0\t0\tb64:QGZvbw==\tb64:***' \
+    $'pane_user_option\tfreeze-options\t0\t0\tb64:cmVtYWluLW9uLWV4aXQ=\tb64:QQ==' \
+    $'pane_user_option\tfreeze-options\t0\t0\tb64:\tb64:QQ=='; do
+    tmux -u set-option -p -t "$first" '@foo' OLD || return 1
+    tmux -u set-option -p -t "$second" '@foo' OLD || return 1
+    {
+      printf 'pane_user_options\tfreeze-options\t0\t0\n'
+      printf 'pane_user_option\tfreeze-options\t0\t0\tb64:QGZvbw==\tb64:QQ==\n'
+      printf '%s\n' "$record"
+      printf 'pane_user_options\tfreeze-options\t0\t1\n'
+      printf 'pane_user_option\tfreeze-options\t0\t1\tb64:QGZvbw==\tb64:Qg==\n'
+    } | write_thaw_snapshot || return 1
+    : >"$GLACIER_TRACE"
+    check '손상 레코드 Thaw 실패 상태' fails run_real_thaw
+    check '손상 pane의 기존 옵션 보존' pane_value_is "$first" '@foo' OLD
+    check '다른 정상 pane은 계속 복원' pane_value_is "$second" '@foo' B
+    check '손상 pane에는 unset/set 호출 없음' fails grep -Fq "$first" "$GLACIER_TRACE"
+  done
+  check '부분 복원 성공 로그 없음' fails grep -q 'thaw complete' "$freeze_test_dir/saves/"*.log
+  freeze_test_cleanup
+}
+
+test_exact_targets_and_duplicates() {
+  freeze_test_setup || return 1
+  local first record
+  first="$(tmux list-panes -t freeze-options -F '#{pane_id}')" || return 1
+  tmux -u set-option -p -t "$first" '@foo' OLD || return 1
+  GLACIER_TRACE="$freeze_test_dir/trace"
+  export GLACIER_TRACE
+  for record in \
+    $'pane_user_options\tfreeze\t0\t0' \
+    $'pane_user_options\tfreeze-options\t0\t99' \
+    $'pane_user_options\tfreeze-options\t99\t0' \
+    $'pane_user_options\t\t0\t0' \
+    $'pane_user_options\tfreeze-options\t\t0' \
+    $'pane_user_options\tfreeze-options\t0\t' \
+    $'pane_user_options\tfreeze-options\tx\t0' \
+    $'pane_user_options\tfreeze-options\t0\tx' \
+    $'pane_user_options\tfreeze-options\t-1\t0' \
+    $'pane_user_options\tfreeze-options\t0\t-1'; do
+    printf '%s\n' "$record" | write_thaw_snapshot || return 1
+    : >"$GLACIER_TRACE"
+    check '없는 대상·잘못된 식별자 실패 상태' fails run_real_thaw
+    check '유사 세션·현재 pane fallback 없음' pane_value_is "$first" '@foo' OLD
+    check '잘못된 대상에는 unset/set 호출 없음' is_empty "$GLACIER_TRACE"
+  done
+  {
+    printf 'pane_user_option\tfreeze-options\t0\t0\tb64:QGZvbw==\tb64:QQ==\n'
+    printf 'pane_user_options\tfreeze-options\t0\t0\n'
+    printf 'pane_user_options\tfreeze-options\t0\t0\n'
+    printf 'pane_user_option\tfreeze-options\t0\t0\tb64:QGZvbw==\tb64:Qg==\n'
+    printf 'pane_user_option\tfreeze-options\t0\t0\tb64:QGVtcHR5\tb64:\n'
+  } | write_thaw_snapshot || return 1
+  : >"$GLACIER_TRACE"
+  check '중복 마커와 역순 레코드 복원 성공' run_real_thaw
+  check '중복 이름의 마지막 값 적용' pane_value_is "$first" '@foo' B
+  check '빈 값은 unset과 구분' pane_value_is "$first" '@empty' ''
+  check '중복 마커도 기존 옵션 삭제 한 번' test "$(awk -F '\t' '$1 == "-up" {n++} END {print n+0}' "$GLACIER_TRACE")" -eq 1
+  freeze_test_cleanup
+}
+
+test_thaw_command_failures() {
+  freeze_test_setup || return 1
+  local first second mode
+  first="$(tmux list-panes -t freeze-options -F '#{pane_id}')" || return 1
+  second="$(tmux split-window -d -P -F '#{pane_id}' -t "$first" 'sleep 60')" || return 1
+  GLACIER_TRACE="$freeze_test_dir/trace"
+  GLACIER_FAIL_PANE="$first"
+  export GLACIER_TRACE GLACIER_FAIL_PANE
+  {
+    printf 'pane_user_options\tfreeze-options\t0\t0\n'
+    printf 'pane_user_option\tfreeze-options\t0\t0\tb64:QGZvbw==\tb64:QQ==\n'
+    printf 'pane_user_option\tfreeze-options\t0\t0\tb64:QGZhaWw=\tb64:bm8tbG9nLXNlY3JldA==\n'
+    printf 'pane_user_option\tfreeze-options\t0\t0\tb64:QGZvbw==\tb64:Qg==\n'
+    printf 'pane_user_option\tfreeze-options\t0\t0\tb64:QGFmdGVy\tb64:Qw==\n'
+    printf 'pane_user_options\tfreeze-options\t0\t1\n'
+    printf 'pane_user_option\tfreeze-options\t0\t1\tb64:QGZvbw==\tb64:Qg==\n'
+  } | write_thaw_snapshot || return 1
+  for mode in thaw-list thaw-unset thaw-set; do
+    tmux -u set-option -p -t "$first" '@foo' OLD || return 1
+    tmux -u set-option -p -t "$first" '@stale' OLD || return 1
+    tmux -u set-option -p -t "$second" '@foo' OLD || return 1
+    : >"$GLACIER_TRACE"
+    GLACIER_FAIL_MODE="$mode"
+    export GLACIER_FAIL_MODE
+    check "${mode} 실패 상태 전파" fails run_real_thaw
+    unset GLACIER_FAIL_MODE
+    check "${mode} 다른 pane 계속 복원" pane_value_is "$second" '@foo' B
+    if [ "$mode" = thaw-set ]; then
+      check 'set 실패 후 나머지 옵션 진행' pane_value_is "$first" '@after' C
+      check '중복 옵션의 마지막 성공값 유지' pane_value_is "$first" '@foo' A
+      check '실패한 set 옵션 없음' pane_option_absent "$first" '@fail'
+    else
+      check "${mode} 기존 값 유지" pane_value_is "$first" '@foo' OLD
+      check "${mode} stale 값 유지" pane_value_is "$first" '@stale' OLD
+      check "${mode} 실패 후 set 호출 없음" fails awk -F '\t' -v pane="$first" '$1 == "-p" && $2 == pane {found=1} END {exit !found}' "$GLACIER_TRACE"
+      if [ "$mode" = thaw-list ]; then
+        check '목록 실패 후 unset 호출 없음' fails grep -Fq "$first" "$GLACIER_TRACE"
+      else
+        check 'unset 실패 후 추가 unset 없음' test "$(awk -F '\t' -v pane="$first" '$1 == "-up" && $2 == pane {n++} END {print n+0}' "$GLACIER_TRACE")" -eq 1
+      fi
+    fi
+    check "${mode} 값·원본 진단 로그 누출 없음" fails grep -Eq 'no-log-secret|노출금지진단' "$freeze_test_dir/saves/"*.log "$freeze_test_dir/thaw-output"
+  done
+  check '명령 실패에서 완전 성공 로그 없음' fails grep -q 'thaw complete' "$freeze_test_dir/saves/"*.log
+  freeze_test_cleanup
+}
+
+test_thaw_special_bytes() {
+  freeze_test_setup || return 1
+  local first name value escaped_name escaped_value i
+  first="$(tmux list-panes -t freeze-options -F '#{pane_id}')" || return 1
+  # tmux 3.0의 기존 단일 pane 레이아웃 결함을 피하도록 두 pane으로 검증한다.
+  tmux split-window -d -t "$first" 'sleep 60' || return 1
+  value=$'한글\t"따옴표"\\역슬래시\n중간\n\n'
+  for ((i=0; i<240; i++)); do value="${value}x"; done
+  value="${value}"$'\n\n'
+  for name in '@' '@a b' $'@탭\t이름' $'@개행\n끝\n' '@"따옴표' '@#{pane_id}' '@semi;' '@back\;'; do
+    prepare_tmux_option_name "$name" escaped_name
+    tmux -u set-option -p -t "$first" "$escaped_name" "$value" || return 1
+  done
+  for i in 0 1 2 3; do
+    escaped_value=';'
+    while [ "${#escaped_value}" -le "$i" ]; do escaped_value="\\${escaped_value}"; done
+    escape_tmux_argument "$escaped_value" escaped_value
+    tmux -u set-option -p -t "$first" "@end$i" "$escaped_value" || return 1
+  done
+  tmux -u set-option -p -t "$first" '@literal' '#{pane_id}' || return 1
+  run_real_freeze || return 1
+  for name in '@' '@a b' $'@탭\t이름' $'@개행\n끝\n' '@"따옴표' '@#{pane_id}' '@semi;' '@back\;'; do
+    prepare_tmux_option_name "$name" escaped_name
+    tmux -u set-option -p -t "$first" "$escaped_name" OLD || return 1
+  done
+  for i in 0 1 2 3; do tmux -u set-option -p -t "$first" "@end$i" OLD || return 1; done
+  tmux -u set-option -p -t "$first" '@literal' OLD || return 1
+  check '특수 이름·값 Thaw 성공' run_real_thaw
+  for name in '@' '@a b' $'@탭\t이름' $'@개행\n끝\n' '@"따옴표' '@#{pane_id}' '@semi;' '@back\;'; do
+    check '특수 이름과 긴 한글·탭·끝 개행 복원' pane_value_is "$first" "$name" "$value"
+  done
+  check '단독 세미콜론 값 복원' pane_value_is "$first" '@end0' ';'
+  check '역슬래시 하나와 끝 세미콜론 복원' pane_value_is "$first" '@end1' '\;'
+  check '역슬래시 둘과 끝 세미콜론 복원' pane_value_is "$first" '@end2' '\\;'
+  check '역슬래시 셋과 끝 세미콜론 복원' pane_value_is "$first" '@end3' '\\\;'
+  check '값의 format 문법 바이트 보존' pane_value_is "$first" '@literal' '#{pane_id}'
+  freeze_test_cleanup
+}
+
+if [ "$#" -gt 0 ]; then
+  for test_function in "$@"; do
+    run_freeze_test "$test_function" "$test_function"
+  done
+else
+  test_codec_bytes
+  test_decoder_portability
+  test_capture_failure
+  test_argument_and_names
+  test_real_tmux_names
+  run_freeze_test 'Freeze 레코드' test_freeze_records
+  run_freeze_test 'Freeze 범위' test_freeze_scope
+  run_freeze_test 'Freeze 실패 보존' test_freeze_failure_keeps_last
+  run_freeze_test 'Thaw 교체' test_replace_and_empty_marker
+  run_freeze_test 'Thaw 구형과 orphan' test_legacy_and_orphan
+  run_freeze_test 'Thaw 손상 격리' test_corrupt_pane_isolation
+  run_freeze_test 'Thaw 정확한 대상' test_exact_targets_and_duplicates
+  run_freeze_test 'Thaw 명령 실패' test_thaw_command_failures
+  run_freeze_test 'Thaw 특수 바이트' test_thaw_special_bytes
+fi
 printf '결과: %s개 통과, %s개 실패\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]
