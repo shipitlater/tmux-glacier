@@ -21,6 +21,19 @@ check() {
   fi
 }
 
+check_required() {
+  local description="$1"
+  shift
+  if "$@"; then
+    passed=$((passed + 1))
+    printf '통과: %s\n' "$description" >&2
+  else
+    failed=$((failed + 1))
+    printf '실패: %s\n' "$description" >&2
+    return 1
+  fi
+}
+
 same_file() { cmp -s "$1" "$2"; }
 is_empty() { [ ! -s "$1" ]; }
 fails() { ! "$@"; }
@@ -197,6 +210,7 @@ test_real_tmux_names() {
 
 freeze_test_setup() {
   freeze_test_original_path="$PATH"
+  freeze_test_original_tmux="${TMUX:-}"
   freeze_test_dir="$(mktemp -d "${TMPDIR:-/tmp}/glacier-freeze-test.XXXXXX")" || return 1
   mkdir -p "$freeze_test_dir/bin" "$freeze_test_dir/saves" || return 1
   GLACIER_REAL_TMUX="$(command -v tmux)"
@@ -204,6 +218,8 @@ freeze_test_setup() {
   GLACIER_TEST_SOCKET="$freeze_test_dir/socket"
   GLACIER_TEST_DIR="$freeze_test_dir"
   export GLACIER_REAL_TMUX GLACIER_REAL_BASE64 GLACIER_TEST_SOCKET GLACIER_TEST_DIR
+  TMUX="$GLACIER_TEST_SOCKET,1,0"
+  export TMUX
   cat >"$freeze_test_dir/bin/tmux" <<'EOF'
 #!/bin/sh
 case "${GLACIER_FAIL_MODE:-}" in
@@ -276,7 +292,9 @@ freeze_test_cleanup() {
     PATH="$freeze_test_original_path"
     export PATH
   fi
-  unset GLACIER_TRACE GLACIER_FAIL_PANE GLACIER_FAIL_MODE GLACIER_REAL_TMUX GLACIER_REAL_BASE64 GLACIER_TEST_SOCKET GLACIER_TEST_DIR freeze_test_dir freeze_test_original_path
+  TMUX="${freeze_test_original_tmux:-}"
+  export TMUX
+  unset GLACIER_TRACE GLACIER_FAIL_PANE GLACIER_FAIL_MODE GLACIER_REAL_TMUX GLACIER_REAL_BASE64 GLACIER_TEST_SOCKET GLACIER_TEST_DIR freeze_test_dir freeze_test_original_path freeze_test_original_tmux
 }
 
 run_real_freeze() {
@@ -579,6 +597,135 @@ test_thaw_special_bytes() {
   freeze_test_cleanup
 }
 
+pane_value_matches_file() {
+  local actual
+  capture_option_value "$1" "$2" actual || return 1
+  printf '%s' "$actual" >"$freeze_test_dir/actual-value" || return 1
+  cmp -s "$3" "$freeze_test_dir/actual-value"
+}
+
+test_server_restart_round_trip() {
+  freeze_test_setup || return 1
+  local first second third value long_value special_name prepared_name prepared_value snapshot
+  tmux -u set-option -g base-index 3 || return 1
+  tmux -u set-option -g pane-base-index 2 || return 1
+  tmux new-window -d -t freeze-options:3 'sleep 60' || return 1
+  tmux kill-window -t freeze-options:0 || return 1
+  first="$(tmux list-panes -t freeze-options:3 -F '#{pane_id}')" || return 1
+  second="$(tmux split-window -d -P -F '#{pane_id}' -t "$first" 'sleep 60')" || return 1
+  third="$(tmux split-window -d -P -F '#{pane_id}' -t "$second" 'sleep 60')" || return 1
+  tmux -u set-option -g '@shared' global || return 1
+  tmux -u set-option -w -t freeze-options:3 '@shared' window || return 1
+  tmux -u set-option -p -t "$first" '@project' ninetoten || return 1
+  tmux -u set-option -p -t "$first" '@empty' '' || return 1
+  tmux -u set-option -p -t "$first" '@shared' local || return 1
+  special_name='@#{pane_id};'
+  value=$'한글\t"따옴표"\\역슬래시\n중간\n\n'
+  prepare_tmux_option_name "$special_name" prepared_name
+  tmux -u set-option -p -t "$first" "$prepared_name" "$value" || return 1
+  printf '%s' "$value" >"$freeze_test_dir/expected-special" || return 1
+  long_value='긴 값'
+  while [ "${#long_value}" -lt 260 ]; do long_value="${long_value}x"; done
+  printf '%s' "$long_value" >"$freeze_test_dir/expected-long" || return 1
+  tmux -u set-option -p -t "$first" '@long' "$long_value" || return 1
+  tmux -u set-option -p -t "$third" '@worktree' feat-order || return 1
+  escape_tmux_argument '\;' prepared_value
+  tmux -u set-option -p -t "$third" '@semi\;' "$prepared_value" || return 1
+
+  check_required '세 pane 실제 Freeze 성공' run_real_freeze || return 1
+  snapshot="$freeze_test_dir/saves/last"
+  check '세 pane의 마커가 스냅샷에 있음' test "$(awk -F '\t' '$1 == "pane_user_options" {n++} END {print n+0}' "$snapshot")" -eq 3
+  check '옵션 없는 pane도 마커를 가짐' awk -F '\t' '$1 == "pane_user_options" && $2 == "freeze-options" && $3 == 3 && $4 == 3 {found=1} END {exit !found}' "$snapshot"
+  check '긴 값 레코드가 한 줄로 저장됨' awk -F '\t' '$1 == "pane_user_option" && $5 == "b64:QGxvbmc=" {found=(NF == 6 && length($6) > 300)} END {exit !found}' "$snapshot"
+
+  tmux kill-server || return 1
+  GLACIER_TEST_SOCKET="$freeze_test_dir/socket-restored"
+  TMUX="$GLACIER_TEST_SOCKET,1,0"
+  export GLACIER_TEST_SOCKET TMUX
+  tmux -f /dev/null new-session -d -s seed 'sleep 60' || return 1
+  tmux -u set-option -g '@frost-dir' "$freeze_test_dir/saves" || return 1
+  tmux -u set-option -g base-index 3 || return 1
+  tmux -u set-option -g pane-base-index 2 || return 1
+  check_required '새 서버에서 실제 Thaw 성공' run_real_thaw || return 1
+  first="$(tmux display-message -p -t freeze-options:3.2 '#{pane_id}')" || return 1
+  second="$(tmux display-message -p -t freeze-options:3.3 '#{pane_id}')" || return 1
+  third="$(tmux display-message -p -t freeze-options:3.4 '#{pane_id}')" || return 1
+  check '재생성된 세 pane 수' test "$(tmux list-panes -t freeze-options:3 -F '#{pane_id}' | wc -l | tr -d ' ')" -eq 3
+  check '첫 pane의 프로젝트 옵션 복원' pane_value_is "$first" '@project' ninetoten
+  check '빈 값은 설정된 상태로 복원' pane_value_is "$first" '@empty' ''
+  check '빈 값은 unset과 다름' tmux -u show-options -p -t "$first" '@empty'
+  check '상위 scope와 동일한 local 이름 복원' pane_value_is "$first" '@shared' local
+  check '중간·끝 개행을 파일 바이트로 비교' pane_value_matches_file "$first" "$special_name" "$freeze_test_dir/expected-special"
+  check '긴 값을 파일 바이트로 비교' pane_value_matches_file "$first" '@long' "$freeze_test_dir/expected-long"
+  check '빈 집합 pane에 local 옵션이 없음' pane_option_absent "$second" '@shared'
+  check '세 번째 pane의 옵션 복원' pane_value_is "$third" '@worktree' feat-order
+  check '끝 세미콜론 이름과 값 복원' pane_value_is "$third" '@semi;' '\;'
+
+  tmux -u set-option -p -t "$first" '@project' OLD || return 1
+  tmux -u set-option -p -t "$first" '@stale' OLD || return 1
+  tmux -u set-option -p -t "$second" '@stale' OLD || return 1
+  check_required '기존 pane 위 반복 Thaw 성공' run_real_thaw || return 1
+  check '반복 Thaw가 스냅샷 값을 복구' pane_value_is "$first" '@project' ninetoten
+  check '반복 Thaw가 stale 옵션을 제거' pane_option_absent "$first" '@stale'
+  check '빈 집합 pane에서도 stale 옵션 제거' pane_option_absent "$second" '@stale'
+  check '반복 Thaw가 pane 수를 유지' test "$(tmux list-panes -t freeze-options:3 -F '#{pane_id}' | wc -l | tr -d ' ')" -eq 3
+  freeze_test_cleanup
+}
+
+test_colliding_name_sets_and_long_name() {
+  freeze_test_setup || return 1
+  local first second long_name colliding_name actual
+  first="$(tmux list-panes -t freeze-options -F '#{pane_id}')" || return 1
+  second="$(tmux split-window -d -P -F '#{pane_id}' -t "$first" 'sleep 60')" || return 1
+  colliding_name=$'@a one\n@b'
+  tmux -u set-option -p -t "$first" "$colliding_name" two || return 1
+  tmux -u set-option -p -t "$second" '@a' one || return 1
+  tmux -u set-option -p -t "$second" '@b' two || return 1
+  tmux -u show-options -p -t "$first" >"$freeze_test_dir/list-one" || return 1
+  tmux -u show-options -p -t "$second" >"$freeze_test_dir/list-two" || return 1
+  check '서로 다른 이름 집합의 나열 문자열 충돌' same_file "$freeze_test_dir/list-one" "$freeze_test_dir/list-two"
+  actual="$(printf '%s' "$colliding_name" | encode_base64)" || return 1
+  printf 'b64:%s\n' "$actual" >"$freeze_test_dir/expected-one"
+  printf 'b64:QGE=\nb64:QGI=\n' >"$freeze_test_dir/expected-two"
+  check '충돌 목록의 첫 집합은 이름 하나' list_pane_user_option_names "$first" >"$freeze_test_dir/actual-one"
+  check '첫 이름 집합의 정확한 열거' same_file "$freeze_test_dir/expected-one" "$freeze_test_dir/actual-one"
+  check '충돌 목록의 둘째 집합은 이름 둘' list_pane_user_option_names "$second" >"$freeze_test_dir/actual-two"
+  check '둘째 이름 집합의 정확한 열거' same_file "$freeze_test_dir/expected-two" "$freeze_test_dir/actual-two"
+  long_name="$colliding_name"
+  while [ "${#long_name}" -lt 245 ]; do long_name="${long_name}x"; done
+  tmux -u set-option -p -t "$second" "$long_name" LONG || return 1
+  actual="$(printf '%s' "$long_name" | encode_base64)" || return 1
+  printf 'b64:QGE=\nb64:%s\nb64:QGI=\n' "$actual" >"$freeze_test_dir/expected-two"
+  check '증가 순서가 필요한 긴 이름 열거' list_pane_user_option_names "$second" >"$freeze_test_dir/actual-two"
+  check '긴 이름과 짧은 접두 이름을 모두 구별' same_file "$freeze_test_dir/expected-two" "$freeze_test_dir/actual-two"
+  freeze_test_cleanup
+}
+
+test_name_listing_partial_failure() {
+  local mode output_dir
+  output_dir="$(mktemp -d "${TMPDIR:-/tmp}/glacier-partial.XXXXXX")" || return 1
+  tmux() {
+    if [ "$#" -eq 5 ]; then
+      printf '@a one\n@b two\n'
+      [ "$mode" != list ]
+      return $?
+    fi
+    case "${6:-}" in
+      @a) printf '@a one\n' ;;
+      @b) printf '@b two\n'; return 47 ;;
+      *) return 1 ;;
+    esac
+  }
+  mode=list
+  check '전체 목록의 부분 출력 후 실패 전파' fails list_pane_user_option_names '%1' >"$output_dir/output"
+  check '전체 목록 실패의 부분 출력 폐기' is_empty "$output_dir/output"
+  mode=query
+  check '이름 질의의 부분 출력 후 실패 전파' fails list_pane_user_option_names '%1' >"$output_dir/output"
+  check '이름 질의 실패의 부분 출력 폐기' is_empty "$output_dir/output"
+  rm -rf "$output_dir"
+  unset -f tmux
+}
+
 if [ "$#" -gt 0 ]; then
   for test_function in "$@"; do
     run_freeze_test "$test_function" "$test_function"
@@ -598,6 +745,9 @@ else
   run_freeze_test 'Thaw 정확한 대상' test_exact_targets_and_duplicates
   run_freeze_test 'Thaw 명령 실패' test_thaw_command_failures
   run_freeze_test 'Thaw 특수 바이트' test_thaw_special_bytes
+  run_freeze_test '서버 재시작 왕복' test_server_restart_round_trip
+  run_freeze_test '이름 목록 충돌과 긴 이름' test_colliding_name_sets_and_long_name
+  test_name_listing_partial_failure
 fi
 printf '결과: %s개 통과, %s개 실패\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

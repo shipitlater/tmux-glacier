@@ -929,6 +929,12 @@ test_locking
 test_idempotent_save
 test_multiple_cycles
 
+if /bin/bash "$(dirname "${BASH_SOURCE[0]}")/pane_user_options_tests.sh"; then
+    pass "pane 사용자 옵션 통합 테스트"
+else
+    fail "pane 사용자 옵션 통합 테스트"
+fi
+
 echo ""
 echo -e "${YELLOW}── Summary ──${NC}"
 echo -e "  ${GREEN}Passed${NC}: $PASS_COUNT"
