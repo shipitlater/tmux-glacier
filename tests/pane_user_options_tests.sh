@@ -440,8 +440,6 @@ test_corrupt_pane_isolation() {
   GLACIER_TRACE="$freeze_test_dir/trace"
   export GLACIER_TRACE
   for record in \
-    $'pane_user_options\tfreeze-options\t0\t0\textra' \
-    $'pane_user_options\tfreeze-options\t0\t0\t' \
     $'pane_user_option\tfreeze-options\t0\t0' \
     $'pane_user_option\tfreeze-options\t0\t0\t\tb64:QQ==' \
     $'pane_user_option\tfreeze-options\t0\t0\tb64:QGZvbw==\t' \
@@ -469,6 +467,35 @@ test_corrupt_pane_isolation() {
     check '손상 pane에는 unset/set 호출 없음' fails grep -Fq "$first" "$GLACIER_TRACE"
   done
   check '부분 복원 성공 로그 없음' fails grep -q 'thaw complete' "$freeze_test_dir/saves/"*.log
+  freeze_test_cleanup
+}
+
+test_corrupt_marker_isolation() {
+  freeze_test_setup || return 1
+  local first malformed order
+  first="$(tmux list-panes -t freeze-options -F '#{pane_id}')" || return 1
+  for malformed in \
+    $'pane_user_options\tfreeze-options\t0\t0\textra' \
+    $'pane_user_options\tfreeze-options\t0\t0\t'; do
+    for order in before after; do
+      tmux -u set-option -p -t "$first" '@foo' OLD || return 1
+      tmux -u set-option -p -t "$first" '@stale' CURRENT || return 1
+      {
+        [ "$order" != before ] || printf '%s\n' "$malformed"
+        printf 'pane_user_options\tfreeze-options\t0\t0\n'
+        printf 'pane_user_option\tfreeze-options\t0\t0\tb64:QGZvbw==\tb64:QQ==\n'
+        [ "$order" != after ] || printf '%s\n' "$malformed"
+      } | write_thaw_snapshot || return 1
+      check '손상 마커 진단 시 실패 상태' fails run_real_thaw
+      check '손상 마커와 유효 마커가 함께 있으면 정상 옵션 복원' pane_value_is "$first" '@foo' A
+      check '손상 마커가 정상 교체를 막지 않음' pane_option_absent "$first" '@stale'
+      check '손상 마커 진단 기록' grep -q '마커 검증 실패' "$freeze_test_dir/saves/"*.log
+    done
+    tmux -u set-option -p -t "$first" '@foo' OLD || return 1
+    printf '%s\n' "$malformed" | write_thaw_snapshot || return 1
+    check '유효 마커가 없으면 실패 상태' fails run_real_thaw
+    check '유효 마커가 없으면 기존 옵션 보존' pane_value_is "$first" '@foo' OLD
+  done
   freeze_test_cleanup
 }
 
@@ -742,6 +769,7 @@ else
   run_freeze_test 'Thaw 교체' test_replace_and_empty_marker
   run_freeze_test 'Thaw 구형과 orphan' test_legacy_and_orphan
   run_freeze_test 'Thaw 손상 격리' test_corrupt_pane_isolation
+  run_freeze_test 'Thaw 손상 마커 격리' test_corrupt_marker_isolation
   run_freeze_test 'Thaw 정확한 대상' test_exact_targets_and_duplicates
   run_freeze_test 'Thaw 명령 실패' test_thaw_command_failures
   run_freeze_test 'Thaw 특수 바이트' test_thaw_special_bytes

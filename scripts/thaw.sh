@@ -182,6 +182,11 @@ restore_pane_user_options() {
 			result=1
 			continue
 		fi
+		if [ "$line_type" = pane_user_options ] && [ "$field_count" -ne 4 ]; then
+			frost_log ERROR "pane 옵션 복원: ${line_number}행 마커 검증 실패"
+			result=1
+			continue
+		fi
 
 		key="${fields[1]}${d}${fields[2]}${d}${fields[3]}"
 		count=${#keys[@]}
@@ -192,7 +197,7 @@ restore_pane_user_options() {
 			keys[i]="$key" markers[i]=false corrupt[i]=false
 		fi
 		target="${fields[1]}:${fields[2]}.${fields[3]}"
-		if [ "$line_type" = pane_user_options ] && [ "$field_count" -eq 4 ]; then
+		if [ "$line_type" = pane_user_options ]; then
 			markers[i]=true
 		elif [ "$line_type" = pane_user_option ] && [ "$field_count" -eq 6 ] &&
 			decode_option_field "${fields[4]}" name && [[ "$name" == @* ]] &&
