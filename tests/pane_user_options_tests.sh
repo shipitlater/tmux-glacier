@@ -195,10 +195,134 @@ test_real_tmux_names() {
   rm -f "$expected_file" "$actual_file" "$socket"
 }
 
+freeze_test_setup() {
+  freeze_test_original_path="$PATH"
+  freeze_test_dir="$(mktemp -d "${TMPDIR:-/tmp}/glacier-freeze-test.XXXXXX")" || return 1
+  mkdir -p "$freeze_test_dir/bin" "$freeze_test_dir/saves" || return 1
+  GLACIER_REAL_TMUX="$(command -v tmux)"
+  GLACIER_REAL_BASE64="$(command -v base64)"
+  GLACIER_TEST_SOCKET="$freeze_test_dir/socket"
+  GLACIER_TEST_DIR="$freeze_test_dir"
+  export GLACIER_REAL_TMUX GLACIER_REAL_BASE64 GLACIER_TEST_SOCKET GLACIER_TEST_DIR
+  cat >"$freeze_test_dir/bin/tmux" <<'EOF'
+#!/bin/sh
+case "${GLACIER_FAIL_MODE:-}" in
+  query) case " $* " in *' show-options -pv '*) exit 37 ;; esac ;;
+  dump) case " $* " in *' list-panes -a '*) exit 38 ;; esac ;;
+esac
+exec "$GLACIER_REAL_TMUX" -S "$GLACIER_TEST_SOCKET" "$@"
+EOF
+  cat >"$freeze_test_dir/bin/base64" <<'EOF'
+#!/bin/sh
+if [ "${GLACIER_FAIL_MODE:-}" = encode ]; then
+  printf '부분 출력'
+  exit 39
+fi
+exec "$GLACIER_REAL_BASE64" "$@"
+EOF
+  cat >"$freeze_test_dir/bin/mktemp" <<'EOF'
+#!/bin/sh
+if [ "${GLACIER_FAIL_MODE:-}" = write ] && [ "$#" -eq 1 ]; then
+  mkdir -p "$GLACIER_TEST_DIR/write-failure"
+  printf '%s\n' "$GLACIER_TEST_DIR/write-failure"
+  exit 0
+fi
+exec /usr/bin/mktemp "$@"
+EOF
+  cat >"$freeze_test_dir/bin/date" <<'EOF'
+#!/bin/sh
+if [ "$#" -eq 1 ] && [ "$1" = '+%Y%m%dT%H%M%S' ]; then
+  printf '20260930T120000\n'
+  exit 0
+fi
+exec /bin/date "$@"
+EOF
+  chmod +x "$freeze_test_dir/bin/"*
+  PATH="$freeze_test_dir/bin:$PATH"
+  export PATH
+  tmux -f /dev/null new-session -d -s freeze-options 'sleep 60' || return 1
+  tmux -u set-option -g '@frost-dir' "$freeze_test_dir/saves" || return 1
+  unset GLACIER_FAIL_MODE
+}
+
+freeze_test_cleanup() {
+  tmux kill-server 2>/dev/null || true
+  rm -rf "$freeze_test_dir"
+  PATH="$freeze_test_original_path"
+  export PATH
+  unset GLACIER_FAIL_MODE
+}
+
+run_real_freeze() {
+  /bin/bash "$SCRIPT_DIR/../scripts/freeze.sh" quiet >/dev/null 2>&1
+}
+
+test_freeze_records() {
+  freeze_test_setup || return 1
+  local first snapshot
+  first="$(tmux list-panes -t freeze-options -F '#{pane_id}')"
+  tmux -u set-option -p -t "$first" '@project' ninetoten || return 1
+  tmux split-window -d -t "$first" 'sleep 60' || return 1
+  check '실제 Freeze 저장 성공' run_real_freeze
+  snapshot="$freeze_test_dir/saves/last"
+  check '두 pane의 마커 기록' test "$(awk -F '\t' '$1 == "pane_user_options" {n++} END {print n+0}' "$snapshot")" -eq 2
+  check '옵션 없는 pane의 마커 기록' test "$(awk -F '\t' '$1 == "pane_user_options" && $4 == 1 {n++} END {print n+0}' "$snapshot")" -eq 1
+  check '마커 4필드와 옵션 6필드' awk -F '\t' '$1 == "pane_user_options" && NF != 4 {exit 1} $1 == "pane_user_option" && NF != 6 {exit 1}' "$snapshot"
+  check 'pane 식별자에 연결된 Base64 옵션' awk -F '\t' '$1 == "pane_user_option" {if ($2 == "freeze-options" && $3 == 0 && $4 == 0 && $5 == "b64:QHByb2plY3Q=" && $6 == "b64:bmluZXRvdGVu") n++} END {exit !(n == 1)}' "$snapshot"
+  check '반복 저장 내용 비교' run_real_freeze
+  check '반복 저장에서 파일 하나 유지' test "$(find "$freeze_test_dir/saves" -name 'frost_*.txt' | wc -l | tr -d ' ')" -eq 1
+  freeze_test_cleanup
+}
+
+test_freeze_scope() {
+  freeze_test_setup || return 1
+  local pane snapshot
+  pane="$(tmux list-panes -t freeze-options -F '#{pane_id}')"
+  tmux -u set-option -g '@global-only' global || return 1
+  tmux -u set-option -w -t freeze-options:0 '@window-only' window || return 1
+  tmux -u set-option -p -t "$pane" remain-on-exit on || return 1
+  tmux -u set-option -p -t "$pane" '@local' local || return 1
+  check 'scope 분리 저장 성공' run_real_freeze
+  snapshot="$freeze_test_dir/saves/last"
+  check 'local 옵션만 한 건 저장' test "$(awk -F '\t' '$1 == "pane_user_option" {n++} END {print n+0}' "$snapshot")" -eq 1
+  check '상위 scope와 built-in 제외' awk -F '\t' '$1 == "pane_user_option" {exit !($5 == "b64:QGxvY2Fs" && $6 == "b64:bG9jYWw=")}' "$snapshot"
+  freeze_test_cleanup
+}
+
+test_freeze_failure_keeps_last() {
+  freeze_test_setup || return 1
+  local pane snapshot old_target mode old_log_count
+  pane="$(tmux list-panes -t freeze-options -F '#{pane_id}')"
+  tmux -u set-option -p -t "$pane" '@fault' before || return 1
+  check '기준 Freeze 저장 성공' run_real_freeze
+  snapshot="$freeze_test_dir/saves/last"
+  old_target="$(readlink "$snapshot")"
+  cp "$snapshot" "$freeze_test_dir/original" || return 1
+  tmux -u set-option -p -t "$pane" '@fault' after || return 1
+  old_log_count="$(grep -c 'freeze complete' "$freeze_test_dir/saves"/*.log || true)"
+  for mode in query encode write dump; do
+    GLACIER_FAIL_MODE="$mode"
+    export GLACIER_FAIL_MODE
+    check "${mode} 실패 전파" fails run_real_freeze
+    check "${mode} 실패 후 대상 바이트 보존" same_file "$snapshot" "$freeze_test_dir/original"
+    check "${mode} 실패 후 last 보존" test "$(readlink "$snapshot")" = "$old_target"
+    check "${mode} 실패 후 성공 로그 없음" test "$(grep -c 'freeze complete' "$freeze_test_dir/saves"/*.log || true)" = "$old_log_count"
+    unset GLACIER_FAIL_MODE
+  done
+  check '실패한 임시 스냅샷 정리' test "$(find "$freeze_test_dir/saves" -name '.frost-*' | wc -l | tr -d ' ')" -eq 0
+  check '같은 초 변경 저장 성공' run_real_freeze
+  check '같은 초 변경 시 새 파일 발행' test "$(readlink "$snapshot")" != "$old_target"
+  check '같은 초 변경 후 이전 파일 보존' same_file "$freeze_test_dir/saves/$old_target" "$freeze_test_dir/original"
+  freeze_test_cleanup
+}
+
 test_codec_bytes
 test_decoder_portability
 test_capture_failure
 test_argument_and_names
 test_real_tmux_names
+test_freeze_records
+test_freeze_scope
+test_freeze_failure_keeps_last
 printf '결과: %s개 통과, %s개 실패\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]
