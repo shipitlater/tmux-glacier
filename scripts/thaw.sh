@@ -180,12 +180,12 @@ restore_pane_user_options() {
 		case "${fields[2]:-}" in ''|*[!0-9]*) valid=false ;; esac
 		case "${fields[3]:-}" in ''|*[!0-9]*) valid=false ;; esac
 		if [ "$valid" = false ]; then
-			frost_log ERROR "pane 옵션 복원: ${line_number}행 식별자 오류"
+			frost_log ERROR "pane option restore: invalid identifier at line ${line_number}"
 			result=1
 			continue
 		fi
 		if [ "$line_type" = pane_user_options ] && [ "$field_count" -ne 4 ]; then
-			frost_log ERROR "pane 옵션 복원: ${line_number}행 마커 검증 실패"
+			frost_log ERROR "pane option restore: marker validation failed at line ${line_number}"
 			result=1
 			continue
 		fi
@@ -209,21 +209,21 @@ restore_pane_user_options() {
 		else
 			corrupt[i]=true
 			result=1
-			frost_log ERROR "pane 옵션 복원: ${target} 레코드 검증 실패 (${line_number}행)"
+			frost_log ERROR "pane option restore: ${target} record validation failed (line ${line_number})"
 		fi
 	done < "$save_file"
 
 	[ "${#keys[@]}" -gt 0 ] || return "$result"
 	# tmux target의 접두사·현재 pane 해석을 피하고 정확한 식별자만 pane_id에 연결한다.
 	if ! inventory="$(tmux -u list-panes -a -F "#{session_name}${d}#{window_index}${d}#{pane_index}${d}#{pane_id}" 2>/dev/null)"; then
-		frost_log ERROR 'pane 옵션 복원: 대상 pane 목록 조회 실패'
+		frost_log ERROR 'pane option restore: failed to list target panes'
 		return 1
 	fi
 	for ((i = 0; i < ${#keys[@]}; i++)); do
 		IFS=$'\t' read -r current_session current_window current_pane <<<"${keys[i]}"
 		target="${current_session}:${current_window}.${current_pane}"
 		if [ "${markers[i]}" = false ]; then
-			frost_log WARN "pane 옵션 복원: ${target} 유효한 마커 없는 레코드 무시"
+			frost_log WARN "pane option restore: ignoring ${target} record without a valid marker"
 			result=1
 			continue
 		fi
@@ -236,11 +236,11 @@ restore_pane_user_options() {
 			fi
 		done <<<"$inventory"
 		if [ -z "$pane_id" ]; then
-			frost_log WARN "pane 옵션 복원: ${target} 대상 pane 없음 (고아 thaw)"
+			frost_log WARN "pane option restore: no target pane for ${target} (orphan thaw)"
 			continue
 		fi
 		if ! names="$(list_pane_user_option_names "$pane_id" 2>/dev/null)"; then
-			frost_log ERROR "pane 옵션 복원: ${target} local 이름 조회 실패"
+			frost_log ERROR "pane option restore: failed to list local names for ${target}"
 			result=1
 			continue
 		fi
@@ -255,7 +255,7 @@ restore_pane_user_options() {
 			current_names[${#current_names[@]}]="$name"
 		done <<<"$names"
 		if [ "$valid" = false ]; then
-			frost_log ERROR "pane 옵션 복원: ${target} local 이름 디코딩 실패"
+			frost_log ERROR "pane option restore: failed to decode local names for ${target}"
 			result=1
 			continue
 		fi
@@ -264,7 +264,7 @@ restore_pane_user_options() {
 		for name in "${current_names[@]}"; do
 			prepare_tmux_option_name "$name" escaped_name
 			if ! tmux -u set-option -up -t "$escaped_target" "$escaped_name" 2>/dev/null; then
-				frost_log ERROR "pane 옵션 복원: ${target} local 옵션 삭제 실패"
+				frost_log ERROR "pane option restore: failed to delete local options for ${target}"
 				result=1
 				valid=false
 				break
@@ -276,7 +276,7 @@ restore_pane_user_options() {
 			prepare_tmux_option_name "${saved_names[j]}" escaped_name
 			escape_tmux_argument "${saved_values[j]}" escaped_value
 			if ! tmux -u set-option -p -t "$escaped_target" "$escaped_name" "$escaped_value" 2>/dev/null; then
-				frost_log ERROR "pane 옵션 복원: ${target} 저장 옵션 설정 실패"
+				frost_log ERROR "pane option restore: failed to set saved options for ${target}"
 				result=1
 			fi
 		done
@@ -388,8 +388,8 @@ main() {
 	restore_state "$actual_file"
 
 	if [ "$option_status" -ne 0 ]; then
-		frost_log ERROR 'thaw 부분 복원: 일부 pane 옵션을 복원하지 못함'
-		display_message 'Glacier: 일부 pane 옵션 복원 실패, 로그를 확인하세요'
+		frost_log ERROR 'partial thaw restore: failed to restore some pane options'
+		display_message 'Glacier: some pane options could not be restored; check the logs'
 		return 1
 	fi
 

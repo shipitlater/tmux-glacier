@@ -216,7 +216,7 @@ main() {
 	fi
 
 	if ! save_all; then
-		frost_log ERROR "Freeze 저장 실패"
+		frost_log ERROR "Freeze save failed"
 		return 1
 	fi
 
