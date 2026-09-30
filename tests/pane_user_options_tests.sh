@@ -5,6 +5,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../scripts/helpers.sh
 source "$SCRIPT_DIR/../scripts/helpers.sh"
+# shellcheck source=../scripts/pane_user_options.sh
+source "$SCRIPT_DIR/../scripts/pane_user_options.sh"
 
 passed=0
 failed=0
@@ -509,7 +511,15 @@ test_exact_targets_and_duplicates() {
   for record in \
     $'pane_user_options\tfreeze\t0\t0' \
     $'pane_user_options\tfreeze-options\t0\t99' \
-    $'pane_user_options\tfreeze-options\t99\t0' \
+    $'pane_user_options\tfreeze-options\t99\t0'; do
+    printf '%s\n' "$record" | write_thaw_snapshot || return 1
+    : >"$GLACIER_TRACE"
+    check '고아 대상 pane은 WARN 성공' run_real_thaw
+    check '고아 thaw WARN 기록' grep -q '고아 thaw' "$freeze_test_dir/saves/"*.log
+    check '고아 thaw가 기존 옵션 유지' pane_value_is "$first" '@foo' OLD
+    check '고아 대상에는 unset/set 호출 없음' is_empty "$GLACIER_TRACE"
+  done
+  for record in \
     $'pane_user_options\t\t0\t0' \
     $'pane_user_options\tfreeze-options\t\t0' \
     $'pane_user_options\tfreeze-options\t0\t' \
@@ -519,7 +529,7 @@ test_exact_targets_and_duplicates() {
     $'pane_user_options\tfreeze-options\t0\t-1'; do
     printf '%s\n' "$record" | write_thaw_snapshot || return 1
     : >"$GLACIER_TRACE"
-    check '없는 대상·잘못된 식별자 실패 상태' fails run_real_thaw
+    check '잘못된 식별자 실패 상태' fails run_real_thaw
     check '유사 세션·현재 pane fallback 없음' pane_value_is "$first" '@foo' OLD
     check '잘못된 대상에는 unset/set 호출 없음' is_empty "$GLACIER_TRACE"
   done
@@ -753,6 +763,96 @@ test_name_listing_partial_failure() {
   unset -f tmux
 }
 
+
+test_orphan_missing_pane_warn_success() {
+  freeze_test_setup || return 1
+  local first second
+  first="$(tmux list-panes -t freeze-options -F '#{pane_id}')" || return 1
+  tmux -u set-option -p -t "$first" '@keep' LIVE || return 1
+  write_thaw_snapshot <<EOF || return 1
+pane_user_options	freeze-options	0	0
+pane_user_option	freeze-options	0	0	b64:QGtlZXA=	b64:T0s=
+pane_user_options	freeze-options	0	99
+pane_user_option	freeze-options	0	99	b64:QG1pc3M=	b64:WFRU
+EOF
+  check '고아 pane thaw 성공' run_real_thaw
+  check '고아 pane WARN 기록' grep -q '고아 thaw' "$freeze_test_dir/saves/"*.log
+  check '유효 pane 옵션 복원' pane_value_is "$first" '@keep' OK
+  freeze_test_cleanup
+}
+
+test_frost_version_write_and_compat() {
+  freeze_test_setup || return 1
+  local first snapshot
+  first="$(tmux list-panes -t freeze-options -F '#{pane_id}')" || return 1
+  tmux -u set-option -p -t "$first" '@ver' V2 || return 1
+  check 'Freeze 성공(version 2)' run_real_freeze
+  snapshot="$(resolve_symlink "$freeze_test_dir/saves/last")"
+  check '새 스냅샷 frost_version=2' test "$(head -1 "$snapshot")" = $'frost_version\t2'
+  write_thaw_snapshot <<EOF || return 1
+pane_user_options	freeze-options	0	0
+pane_user_option	freeze-options	0	0	b64:QHZlcg==	b64:VjE=
+EOF
+  # write_thaw_snapshot writes frost_version 1 header
+  check 'version 1 thaw 성공' run_real_thaw
+  check 'version 1 옵션 복원' pane_value_is "$first" '@ver' V1
+  printf 'frost_version\t3\n' >"$freeze_test_dir/saves/manual.txt"
+  ln -sf manual.txt "$freeze_test_dir/saves/last"
+  check '알 수 없는 version 거부' fails run_real_thaw
+  check '지원하지 않는 버전 로그' grep -q 'unsupported frost_version' "$freeze_test_dir/saves/"*.log
+  freeze_test_cleanup
+}
+
+test_frost_dir_guard_and_readonly_migrate() {
+  freeze_test_setup || return 1
+  local ro fallback marker
+  ro="$freeze_test_dir/readonly-saves"
+  fallback="$freeze_test_dir/fallback-saves"
+  mkdir -p "$ro" "$fallback" || return 1
+  printf 'frost_version\t1\npane\tdemo\t0\t1\t0\ttitle\t:/tmp\t1\n' >"$ro/frost_old.txt"
+  ln -s frost_old.txt "$ro/last"
+  chmod a-w "$ro" || return 1
+
+  local saved_default saved_cache
+  saved_default="$default_frost_dir"
+  saved_cache="$default_frost_cache_dir"
+  _frost_dir_cache=""
+  _frost_dir_cache_key=""
+  default_frost_dir="$fallback"
+  default_frost_cache_dir="$freeze_test_dir/cache-saves"
+  tmux -u set-option -g '@frost-dir' "$ro" || return 1
+
+  check '읽기 전용 경로에서 frost_dir fallback' test "$(frost_dir)" = "$fallback"
+  marker="$fallback/.frost-migrated-from"
+  check 'one-shot migrate 마커' test -f "$marker"
+  check '원본 save 보존' test -f "$ro/frost_old.txt"
+  check '대상 save 복사' test -f "$fallback/frost_old.txt"
+  check '대상 last 링크' test -L "$fallback/last"
+
+  _frost_dir_cache=""
+  _frost_dir_cache_key=""
+  check '빈 @frost-dir 거부' fails validate_frost_dir_setting ""
+  check '루트 @frost-dir 거부' fails validate_frost_dir_setting "/"
+  check '상대 @frost-dir 거부' fails validate_frost_dir_setting "relative/path"
+  default_frost_dir="$saved_default"
+  default_frost_cache_dir="$saved_cache"
+  chmod u+w "$ro" 2>/dev/null || true
+  freeze_test_cleanup
+}
+
+test_freeze_empty_line_guard() {
+  freeze_test_setup || return 1
+  local first snapshot
+  first="$(tmux list-panes -t freeze-options -F '#{pane_id}')" || return 1
+  tmux -u set-option -p -t "$first" '@ok' 1 || return 1
+  # Real freeze already receives trailing blank lines from here-strings; success locks the guard.
+  check '빈 줄이 있어도 Freeze 성공' run_real_freeze
+  snapshot="$(resolve_symlink "$freeze_test_dir/saves/last")"
+  check '빈 줄 가드 후 스냅샷 존재' test -f "$snapshot"
+  check '빈 줄 가드 후 옵션 기록' grep -q $'pane_user_option\t' "$snapshot"
+  freeze_test_cleanup
+}
+
 if [ "$#" -gt 0 ]; then
   for test_function in "$@"; do
     run_freeze_test "$test_function" "$test_function"
@@ -768,6 +868,10 @@ else
   run_freeze_test 'Freeze 실패 보존' test_freeze_failure_keeps_last
   run_freeze_test 'Thaw 교체' test_replace_and_empty_marker
   run_freeze_test 'Thaw 구형과 orphan' test_legacy_and_orphan
+  run_freeze_test '고아 pane WARN 성공' test_orphan_missing_pane_warn_success
+  run_freeze_test 'frost_version 호환' test_frost_version_write_and_compat
+  run_freeze_test 'frost-dir guard와 migrate' test_frost_dir_guard_and_readonly_migrate
+  run_freeze_test 'Freeze 빈 줄 가드' test_freeze_empty_line_guard
   run_freeze_test 'Thaw 손상 격리' test_corrupt_pane_isolation
   run_freeze_test 'Thaw 손상 마커 격리' test_corrupt_marker_isolation
   run_freeze_test 'Thaw 정확한 대상' test_exact_targets_and_duplicates

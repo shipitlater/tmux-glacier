@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #
-# thaw.sh — restore tmux sessions from a frost save file.
+# thaw.sh — restore tmux sessions from a frost_* save file.
 #
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/helpers.sh
 source "$CURRENT_DIR/helpers.sh"
+# shellcheck source=scripts/pane_user_options.sh
+source "$CURRENT_DIR/pane_user_options.sh"
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -234,8 +236,7 @@ restore_pane_user_options() {
 			fi
 		done <<<"$inventory"
 		if [ -z "$pane_id" ]; then
-			frost_log ERROR "pane 옵션 복원: ${target} 대상 pane 없음"
-			result=1
+			frost_log WARN "pane 옵션 복원: ${target} 대상 pane 없음 (고아 thaw)"
 			continue
 		fi
 		if ! names="$(list_pane_user_option_names "$pane_id" 2>/dev/null)"; then
@@ -358,12 +359,13 @@ main() {
 		return 1
 	fi
 
-	# Verify version header
-	local first_line
+	# Verify version header: accept frost_version 1 or 2 only.
+	local first_line version_field version_value
 	first_line="$(head -1 "$actual_file")"
-	if [[ "$first_line" != frost_version* ]]; then
-		frost_log ERROR "thaw failed — invalid save file: $actual_file"
-		display_message "Glacier: invalid save file!"
+	IFS=$'\t' read -r version_field version_value _ <<<"$first_line"
+	if [ "$version_field" != "frost_version" ] || { [ "$version_value" != "1" ] && [ "$version_value" != "2" ]; }; then
+		frost_log ERROR "thaw failed — unsupported frost_version: ${version_value:-missing} ($actual_file)"
+		display_message "Glacier: unsupported save version!"
 		return 1
 	fi
 

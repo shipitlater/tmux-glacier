@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #
-# freeze.sh — save all tmux sessions to a frost file.
+# freeze.sh — save all tmux sessions to a frost_* save file.
 #
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/helpers.sh
 source "$CURRENT_DIR/helpers.sh"
+# shellcheck source=scripts/pane_user_options.sh
+source "$CURRENT_DIR/pane_user_options.sh"
 
 # if "quiet" the script produces no tmux messages
 SCRIPT_OUTPUT="$1"
@@ -86,12 +88,17 @@ dump_pane_user_options() {
 	panes="$(set -o pipefail; tmux -u list-panes -a -F "#{session_name}${d}#{window_index}${d}#{pane_index}${d}#{pane_id}" | sort -t "$d" -k1,1 -k2,2n -k3,3n)" || return 1
 	[ -n "$panes" ] || return 0
 
-	while IFS="$d" read -r session_name window_index pane_index pane_id; do
+	while IFS="$d" read -r session_name window_index pane_index pane_id || [ -n "$session_name$window_index$pane_index$pane_id" ]; do
+		# Skip blank lines from list input; non-empty incomplete rows still fail.
+		if [ -z "$session_name$window_index$pane_index$pane_id" ]; then
+			continue
+		fi
 		[ -n "$pane_id" ] || return 1
 		names="$(list_pane_user_option_names "$pane_id")" || return 1
 		printf 'pane_user_options%s%s%s%s%s%s\n' "$d" "$session_name" "$d" "$window_index" "$d" "$pane_index" || return 1
 		[ -n "$names" ] || continue
-		while IFS= read -r encoded_name; do
+		while IFS= read -r encoded_name || [ -n "$encoded_name" ]; do
+			[ -n "$encoded_name" ] || continue
 			decode_option_field "$encoded_name" name || return 1
 			capture_option_value "$pane_id" "$name" value || return 1
 			encoded_value="$(printf '%s' "$value" | encode_base64)" || return 1
@@ -152,7 +159,7 @@ save_all() {
 	temporary_file="$(mktemp "$dir/.frost-save.XXXXXX")" || return 1
 
 	if ! {
-		printf 'frost_version%s1\n' "$d" &&
+		printf 'frost_version%s2\n' "$d" &&
 		dump_panes &&
 		dump_pane_user_options &&
 		dump_windows &&

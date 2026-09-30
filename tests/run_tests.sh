@@ -71,7 +71,7 @@ do_freeze() {
     local save_file
     save_file="$SAVE_DIR/frost_$(date +%Y%m%dT%H%M%S%N).txt"
 
-    echo "frost_version${d}1" > "$save_file"
+    echo "frost_version${d}2" > "$save_file"
 
     T list-panes -a \
         -F "pane${d}#{session_name}${d}#{window_index}${d}#{window_active}${d}#{pane_index}${d}#{pane_title}${d}:#{pane_current_path}${d}#{pane_active}" \
@@ -174,7 +174,7 @@ test_save_file_format() {
     # Version header
     local first_line
     first_line="$(head -1 "$save_file")"
-    if [[ "$first_line" == "frost_version"*"1" ]]; then
+    if [[ "$first_line" == "frost_version"*"2" ]]; then
         pass "version header present"
     else
         fail "version header missing or wrong: $first_line"
@@ -562,6 +562,19 @@ test_thaw_rejects_missing_file() {
         pass "invalid save file correctly detected"
     else
         fail "invalid save file not detected"
+    fi
+
+    # Unsupported frost_version must be rejected by real thaw.sh
+    # Always pin TMUX to the isolated test socket — never touch the default server.
+    fresh_server
+    T set-option -g @frost-dir "$SAVE_DIR"
+    local unsupported="$SAVE_DIR/frost_unsupported.txt"
+    printf '%s\n' $'frost_version\t9' > "$unsupported"
+    ln -fs "$(basename "$unsupported")" "$SAVE_DIR/last"
+    if ! TMUX="${SOCKET},$$,0" /bin/bash "$(dirname "${BASH_SOURCE[0]}")/../scripts/thaw.sh" >/dev/null 2>&1; then
+        pass "unsupported frost_version rejected"
+    else
+        fail "unsupported frost_version was accepted"
     fi
 }
 
