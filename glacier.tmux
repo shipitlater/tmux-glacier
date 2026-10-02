@@ -21,28 +21,39 @@ set_freeze_binding() {
 set_thaw_binding() {
 	local key
 	key="$(get_tmux_option "@frost-restore-key" "C-r")"
-	tmux bind-key "$key" run-shell "'$CURRENT_DIR/scripts/thaw.sh'"
+	# thaw-key.sh reads @frost-thaw-confirm and session pane counts at keypress time.
+	tmux bind-key "$key" run-shell "'$CURRENT_DIR/scripts/thaw-key.sh'"
 }
 
 # ── Auto-save ───────────────────────────────────────────────────────
 
 # Background loop that saves at a fixed interval.
-# The loop is a child of the tmux server, so it dies on normal exit.
+# The loop monitors the original tmux server PID and exits when the server stops.
 # A PID file prevents duplicates on config reloads.
 
 stop_auto_save() {
 	local dir
-	dir="$(frost_dir)"
+	dir="$(frost_dir)" || return 1
 	local pid_file="$dir/.auto_save.pid"
+	local meta_file="$dir/.auto_save.meta"
 
 	if [ -f "$pid_file" ]; then
-		local old_pid
+		local old_pid retries=0
 		old_pid="$(cat "$pid_file")"
 		if kill -0 "$old_pid" 2>/dev/null; then
-			kill "$old_pid" 2>/dev/null
+			kill "$old_pid" 2>/dev/null || true
+			# Wait for EXIT cleanup before a new loop uses the same files.
+			while kill -0 "$old_pid" 2>/dev/null; do
+				if [ "$retries" -ge 30 ]; then
+					frost_log ERROR "failed to stop existing auto-save loop (pid $old_pid)"
+					return 1
+				fi
+				sleep 0.1
+				retries=$((retries + 1))
+			done
 		fi
-		rm -f "$pid_file"
 	fi
+	rm -f "$pid_file" "$meta_file"
 }
 
 setup_auto_save() {
@@ -56,42 +67,57 @@ setup_auto_save() {
 	fi
 
 	local dir
-	dir="$(frost_dir)"
+	dir="$(frost_dir)" || return 1
 	local pid_file="$dir/.auto_save.pid"
+	local meta_file="$dir/.auto_save.meta"
+	local loop_script="$CURRENT_DIR/scripts/auto_save_loop.sh"
 	local freeze_script="$CURRENT_DIR/scripts/freeze.sh"
 
-	mkdir -p "$dir"
+	mkdir -p "$dir" || return 1
 
-	# If a loop is already running, leave it alone.
-	# Verify the PID is actually our loop, not a recycled PID.
-	if [ -f "$pid_file" ]; then
-		local old_pid
-		old_pid="$(cat "$pid_file")"
-		if kill -0 "$old_pid" 2>/dev/null &&
-			ps -p "$old_pid" -o args= 2>/dev/null | grep -q "auto_save_loop"; then
-			frost_log INFO "auto-save loop already running (pid $old_pid)"
-			return
-		fi
-		rm -f "$pid_file"
-	fi
-
-	# Extract the socket path from $TMUX (format: /path/to/socket,pid,session)
-	local tmux_socket
+	local tmux_socket tmux_server_pid
 	tmux_socket="$(echo "$TMUX" | cut -d, -f1)"
+	tmux_server_pid="$(tmux -S "$tmux_socket" display-message -p '#{pid}')" || return 1
+
+	# Reuse a loop only if its server, script paths, and fingerprints match.
+	# Restart with the current scripts after a server restart, plugin move, or update.
+	if [ -f "$pid_file" ]; then
+		local old_pid old_args
+		old_pid="$(cat "$pid_file")"
+		old_args="$(ps -ww -p "$old_pid" -o args= 2>/dev/null)"
+		if kill -0 "$old_pid" 2>/dev/null &&
+			printf '%s\n' "$old_args" | grep -q "auto_save_loop"; then
+			# The final argument is the original server PID, identifying restarts on the same socket.
+			if auto_save_meta_matches "$meta_file" "$loop_script" "$freeze_script" &&
+				[ "${old_args##* }" = "$tmux_server_pid" ]; then
+				frost_log INFO "auto-save loop already running (pid $old_pid)"
+				return
+			fi
+			frost_log INFO "restarting auto-save loop after script or server change (previous pid $old_pid)"
+			stop_auto_save || return 1
+		else
+			rm -f "$pid_file" "$meta_file"
+		fi
+	fi
 
 	# Launch via setsid into a dedicated script that closes all inherited
 	# fds — this prevents tmux's run-shell pipe from staying open, which
 	# would block TPM installs and config reloads.
 	if command -v setsid >/dev/null 2>&1; then
-		setsid "$CURRENT_DIR/scripts/auto_save_loop.sh" \
-			"$pid_file" "$((interval * 60))" "$freeze_script" "$tmux_socket" &
+		setsid "$loop_script" \
+			"$pid_file" "$((interval * 60))" "$freeze_script" "$tmux_socket" "$tmux_server_pid" &
 	else
-		# setsid가 없는 macOS 등에서는 nohup을 사용하여 백그라운드 분리 기동
-		nohup "$CURRENT_DIR/scripts/auto_save_loop.sh" \
-			"$pid_file" "$((interval * 60))" "$freeze_script" "$tmux_socket" >/dev/null 2>&1 &
+		# On macOS and other systems without setsid, use nohup to launch detached in the background.
+		nohup "$loop_script" \
+			"$pid_file" "$((interval * 60))" "$freeze_script" "$tmux_socket" "$tmux_server_pid" >/dev/null 2>&1 &
 	fi
-	# 자식 프로세스 기동 즉시 부모 쉘이 PID를 파일에 기록하여 Race Condition 방지
-	echo $! > "$pid_file"
+	# Record the new loop's PID immediately and stop it if writing its files fails.
+	local new_pid=$!
+	if ! printf '%s\n' "$new_pid" > "$pid_file" || ! write_auto_save_meta "$meta_file" "$loop_script" "$freeze_script"; then
+		kill "$new_pid" 2>/dev/null
+		rm -f "$pid_file" "$meta_file"
+		return 1
+	fi
 	frost_log INFO "auto-save loop started (interval ${interval}m)"
 }
 

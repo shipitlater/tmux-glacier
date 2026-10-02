@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #
-# thaw.sh — restore tmux sessions from a frost save file.
+# thaw.sh — restore tmux sessions from a frost_* save file.
 #
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/helpers.sh
 source "$CURRENT_DIR/helpers.sh"
+# shellcheck source=scripts/pane_user_options.sh
+source "$CURRENT_DIR/pane_user_options.sh"
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -150,6 +152,138 @@ restore_all_panes() {
 	fi
 }
 
+# After validating while preserving empty fields, replace pane-local user options on a per-pane basis.
+restore_pane_user_options() {
+	local save_file="$1" line remainder line_type key target pane_id inventory
+	local name value names encoded_name escaped_target escaped_name escaped_value
+	local i j count field_count line_number=0 result=0 valid
+	local current_session current_window current_pane current_id
+	local -a fields keys markers corrupt owners saved_names saved_values current_names
+	keys=() markers=() corrupt=() owners=() saved_names=() saved_values=()
+
+	while IFS= read -r line || [ -n "$line" ]; do
+		line_number=$((line_number + 1))
+		line_type="${line%%$'\t'*}"
+		case "$line_type" in pane_user_options|pane_user_option) ;; *) continue ;; esac
+
+		# Split only on actual tabs, without IFS whitespace collapsing or replacing with another delimiter.
+		fields=()
+		remainder="$line"
+		while [[ "$remainder" == *$'\t'* ]]; do
+			fields[${#fields[@]}]="${remainder%%$'\t'*}"
+			remainder="${remainder#*$'\t'}"
+		done
+		fields[${#fields[@]}]="$remainder"
+		field_count=${#fields[@]}
+		valid=true
+		[ -n "${fields[1]:-}" ] || valid=false
+		case "${fields[2]:-}" in ''|*[!0-9]*) valid=false ;; esac
+		case "${fields[3]:-}" in ''|*[!0-9]*) valid=false ;; esac
+		if [ "$valid" = false ]; then
+			frost_log ERROR "pane option restore: invalid identifier at line ${line_number}"
+			result=1
+			continue
+		fi
+		if [ "$line_type" = pane_user_options ] && [ "$field_count" -ne 4 ]; then
+			frost_log ERROR "pane option restore: marker validation failed at line ${line_number}"
+			result=1
+			continue
+		fi
+
+		key="${fields[1]}${d}${fields[2]}${d}${fields[3]}"
+		count=${#keys[@]}
+		for ((i = 0; i < count; i++)); do
+			[ "${keys[i]}" = "$key" ] && break
+		done
+		if [ "$i" -eq "$count" ]; then
+			keys[i]="$key" markers[i]=false corrupt[i]=false
+		fi
+		target="${fields[1]}:${fields[2]}.${fields[3]}"
+		if [ "$line_type" = pane_user_options ]; then
+			markers[i]=true
+		elif [ "$line_type" = pane_user_option ] && [ "$field_count" -eq 6 ] &&
+			decode_option_field "${fields[4]}" name && [[ "$name" == @* ]] &&
+			decode_option_field "${fields[5]}" value; then
+			j=${#owners[@]}
+			owners[j]="$i" saved_names[j]="$name" saved_values[j]="$value"
+		else
+			corrupt[i]=true
+			result=1
+			frost_log ERROR "pane option restore: ${target} record validation failed (line ${line_number})"
+		fi
+	done < "$save_file"
+
+	[ "${#keys[@]}" -gt 0 ] || return "$result"
+	# Avoid tmux target prefix and current-pane resolution; associate only the exact identifier with pane_id.
+	if ! inventory="$(tmux -u list-panes -a -F "#{session_name}${d}#{window_index}${d}#{pane_index}${d}#{pane_id}" 2>/dev/null)"; then
+		frost_log ERROR 'pane option restore: failed to list target panes'
+		return 1
+	fi
+	for ((i = 0; i < ${#keys[@]}; i++)); do
+		IFS=$'\t' read -r current_session current_window current_pane <<<"${keys[i]}"
+		target="${current_session}:${current_window}.${current_pane}"
+		if [ "${markers[i]}" = false ]; then
+			frost_log WARN "pane option restore: ignoring ${target} record without a valid marker"
+			result=1
+			continue
+		fi
+		[ "${corrupt[i]}" = false ] || continue
+		pane_id=''
+		while IFS=$'\t' read -r current_session current_window current_pane current_id; do
+			if [ "${current_session}${d}${current_window}${d}${current_pane}" = "${keys[i]}" ]; then
+				pane_id="$current_id"
+				break
+			fi
+		done <<<"$inventory"
+		if [ -z "$pane_id" ]; then
+			frost_log WARN "pane option restore: no target pane for ${target} (orphan thaw)"
+			continue
+		fi
+		if ! names="$(list_pane_user_option_names "$pane_id" 2>/dev/null)"; then
+			frost_log ERROR "pane option restore: failed to list local names for ${target}"
+			result=1
+			continue
+		fi
+		current_names=()
+		valid=true
+		while IFS= read -r encoded_name; do
+			[ -n "$encoded_name" ] || continue
+			if ! decode_option_field "$encoded_name" name; then
+				valid=false
+				break
+			fi
+			current_names[${#current_names[@]}]="$name"
+		done <<<"$names"
+		if [ "$valid" = false ]; then
+			frost_log ERROR "pane option restore: failed to decode local names for ${target}"
+			result=1
+			continue
+		fi
+
+		escape_tmux_argument "$pane_id" escaped_target
+		for name in "${current_names[@]}"; do
+			prepare_tmux_option_name "$name" escaped_name
+			if ! tmux -u set-option -up -t "$escaped_target" "$escaped_name" 2>/dev/null; then
+				frost_log ERROR "pane option restore: failed to delete local options for ${target}"
+				result=1
+				valid=false
+				break
+			fi
+		done
+		[ "$valid" = true ] || continue
+		for ((j = 0; j < ${#owners[@]}; j++)); do
+			[ "${owners[j]}" = "$i" ] || continue
+			prepare_tmux_option_name "${saved_names[j]}" escaped_name
+			escape_tmux_argument "${saved_values[j]}" escaped_value
+			if ! tmux -u set-option -p -t "$escaped_target" "$escaped_name" "$escaped_value" 2>/dev/null; then
+				frost_log ERROR "pane option restore: failed to set saved options for ${target}"
+				result=1
+			fi
+		done
+	done
+	return "$result"
+}
+
 restore_window_properties() {
 	local save_file="$1"
 	# shellcheck disable=SC2034  # window_flags is a positional field, not used directly
@@ -208,7 +342,7 @@ restore_state() {
 
 main() {
 	local save_file
-	save_file="$(last_frost_file)"
+	save_file="$(last_frost_file)" || return 1
 
 	if [ ! -L "$save_file" ] && [ ! -f "$save_file" ]; then
 		frost_log ERROR "thaw failed — no save file found"
@@ -225,30 +359,44 @@ main() {
 		return 1
 	fi
 
-	# Verify version header
-	local first_line
+	# Verify version header: accept frost_version 1 or 2 only.
+	local first_line version_field version_value
 	first_line="$(head -1 "$actual_file")"
-	if [[ "$first_line" != frost_version* ]]; then
-		frost_log ERROR "thaw failed — invalid save file: $actual_file"
-		display_message "Glacier: invalid save file!"
+	IFS=$'\t' read -r version_field version_value _ <<<"$first_line"
+	if [ "$version_field" != "frost_version" ] || { [ "$version_value" != "1" ] && [ "$version_value" != "2" ]; }; then
+		frost_log ERROR "thaw failed — unsupported frost_version: ${version_value:-missing} ($actual_file)"
+		display_message "Glacier: unsupported save version!"
 		return 1
 	fi
 
-	if ! acquire_lock; then
+	local lock_status=0
+	acquire_lock || lock_status=$?
+	if [ "$lock_status" -eq 1 ]; then
 		frost_log WARN "thaw skipped — lock held by another process"
 		display_message "Glacier: another operation in progress"
 		return 0
+	elif [ "$lock_status" -ne 0 ]; then
+		frost_log ERROR "Glacier: failed to prepare save directory or lock file"
+		return 1
 	fi
 
 	frost_log INFO "thaw started from $(basename "$actual_file")"
 
 	display_message "Glacier: restoring..."
 
+	local option_status=0
 	restore_all_panes "$actual_file"
+	restore_pane_user_options "$actual_file" || option_status=1
 	restore_window_properties "$actual_file"
 	restore_active_panes "$actual_file"
 	restore_active_windows "$actual_file"
 	restore_state "$actual_file"
+
+	if [ "$option_status" -ne 0 ]; then
+		frost_log ERROR 'partial thaw restore: failed to restore some pane options'
+		display_message 'Glacier: some pane options could not be restored; check the logs'
+		return 1
+	fi
 
 	local sessions panes
 	sessions="$(tmux list-sessions 2>/dev/null | wc -l | tr -d ' ')"

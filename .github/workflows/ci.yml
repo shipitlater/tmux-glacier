@@ -17,15 +17,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y shellcheck
       - name: Lint scripts
-        run: shellcheck -x --severity=warning scripts/*.sh tests/run_tests.sh glacier.tmux
+        run: shellcheck -x --severity=warning scripts/*.sh tests/run_tests.sh tests/pane_user_options_tests.sh glacier.tmux
 
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-      - name: Install tmux
+      - name: Install tmux on Linux
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y tmux
-      - name: Run tests
-        run: ./tests/run_tests.sh
+      - name: Install tmux on macOS
+        if: runner.os == 'macOS'
+        run: brew install tmux
+      - name: Run core and pane option tests
+        run: /bin/bash tests/run_tests.sh

@@ -1,4 +1,5 @@
+SHELL := /bin/bash
 .PHONY: test
 
 test:
-	bash tests/run_tests.sh
+	$(SHELL) tests/run_tests.sh

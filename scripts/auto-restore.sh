@@ -18,7 +18,7 @@ if [ "$total_panes" -gt 1 ]; then
 	exit 0
 fi
 
-save_file="$(last_frost_file)"
+save_file="$(last_frost_file)" || exit 1
 if [ ! -L "$save_file" ] && [ ! -f "$save_file" ]; then
 	frost_log INFO "auto-restore skipped — no save file"
 	exit 0

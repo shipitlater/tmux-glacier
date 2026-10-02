@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #
-# freeze.sh — save all tmux sessions to a frost file.
+# freeze.sh — save all tmux sessions to a frost_* save file.
 #
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/helpers.sh
 source "$CURRENT_DIR/helpers.sh"
+# shellcheck source=scripts/pane_user_options.sh
+source "$CURRENT_DIR/pane_user_options.sh"
 
 # if "quiet" the script produces no tmux messages
 SCRIPT_OUTPUT="$1"
@@ -74,11 +76,39 @@ validate_layout() {
 
 # ── Dump functions ──────────────────────────────────────────────────
 
-dump_panes() {
+dump_panes() (
+	set -o pipefail
 	tmux list-panes -a -F "$(pane_format)" | sort -t "$d" -k2,2 -k3,3n -k5,5n
+)
+
+dump_pane_user_options() {
+	local LC_ALL=C
+	local panes pane_id session_name window_index pane_index
+	local names encoded_name name value encoded_value
+	panes="$(set -o pipefail; tmux -u list-panes -a -F "#{session_name}${d}#{window_index}${d}#{pane_index}${d}#{pane_id}" | sort -t "$d" -k1,1 -k2,2n -k3,3n)" || return 1
+	[ -n "$panes" ] || return 0
+
+	while IFS="$d" read -r session_name window_index pane_index pane_id || [ -n "$session_name$window_index$pane_index$pane_id" ]; do
+		# Skip blank lines from list input; non-empty incomplete rows still fail.
+		if [ -z "$session_name$window_index$pane_index$pane_id" ]; then
+			continue
+		fi
+		[ -n "$pane_id" ] || return 1
+		names="$(list_pane_user_option_names "$pane_id")" || return 1
+		printf 'pane_user_options%s%s%s%s%s%s\n' "$d" "$session_name" "$d" "$window_index" "$d" "$pane_index" || return 1
+		[ -n "$names" ] || continue
+		while IFS= read -r encoded_name || [ -n "$encoded_name" ]; do
+			[ -n "$encoded_name" ] || continue
+			decode_option_field "$encoded_name" name || return 1
+			capture_option_value "$pane_id" "$name" value || return 1
+			encoded_value="$(printf '%s' "$value" | encode_base64)" || return 1
+			printf 'pane_user_option%s%s%s%s%s%s%s%s%sb64:%s\n' "$d" "$session_name" "$d" "$window_index" "$d" "$pane_index" "$d" "$encoded_name" "$d" "$encoded_value" || return 1
+		done <<< "$names"
+	done <<< "$panes"
 }
 
-dump_windows() {
+dump_windows() (
+	set -o pipefail
 	tmux list-windows -a -F "$(window_format)" |
 		while IFS=$d read -r line_type session_name window_index window_name window_active window_flags window_layout automatic_rename; do
 			# Validate layout — replace stacked layouts with "tiled"
@@ -91,7 +121,7 @@ dump_windows() {
 
 			echo "${line_type}${d}${session_name}${d}${window_index}${d}${window_name}${d}${window_active}${d}${window_flags}${d}${safe_layout}${d}${automatic_rename}"
 		done
-}
+)
 
 dump_state() {
 	tmux display-message -p "$(state_format)"
@@ -103,14 +133,17 @@ remove_old_backups() {
 	local delete_after
 	delete_after="$(get_tmux_option "@frost-delete-backup-after" "30")"
 	local dir
-	dir="$(frost_dir)"
+	dir="$(frost_dir)" || return 1
 
 	# Collect all frost save files, sorted newest-first, skip the 5 newest
 	# (mapfile is bash 4+; read into the array instead so this works on the
 	# /bin/bash 3.2 that ships with macOS)
 	local -a files
 	local file
+	local last_file="$dir/last"
 	while IFS= read -r file; do
+		# Preserve the file selected by last, including old saves imported by migration.
+		[ "$file" -ef "$last_file" ] && continue
 		files+=("$file")
 	done < <(ls -t "$dir"/frost_*.txt 2>/dev/null | tail -n +6)
 	[[ ${#files[@]} -eq 0 ]] && return
@@ -121,37 +154,64 @@ remove_old_backups() {
 # ── Main ───────────────────────────────────────────────────────────
 
 save_all() {
-	local frost_file
-	frost_file="$(frost_file_path)"
-	local last_file
-	last_file="$(last_frost_file)"
-	local dir
-	dir="$(frost_dir)"
+	local frost_file last_file dir temporary_file temporary_link base sequence
+	frost_file="$(frost_file_path)" || return 1
+	last_file="$(last_frost_file)" || return 1
+	dir="$(frost_dir)" || return 1
+	mkdir -p "$dir" || return 1
+	temporary_file="$(mktemp "$dir/.frost-save.XXXXXX")" || return 1
 
-	mkdir -p "$dir"
+	if ! {
+		printf 'frost_version%s2\n' "$d" &&
+		dump_panes &&
+		dump_pane_user_options &&
+		dump_windows &&
+		dump_state
+	} > "$temporary_file"; then
+		rm -f "$temporary_file"
+		return 1
+	fi
 
-	# Write version header
-	echo "frost_version${d}1" > "$frost_file"
+	if [ -f "$last_file" ] && cmp -s "$temporary_file" "$last_file"; then
+		rm -f "$temporary_file" || return 1
+		remove_old_backups
+		return $?
+	fi
 
-	# Dump panes, windows, state
-	dump_panes   >> "$frost_file"
-	dump_windows >> "$frost_file"
-	dump_state   >> "$frost_file"
+	if [ -e "$frost_file" ] || [ -L "$frost_file" ]; then
+		base="${frost_file%.txt}"
+		sequence=1
+		while [ -e "${base}_${sequence}.txt" ] || [ -L "${base}_${sequence}.txt" ]; do
+			sequence=$((sequence + 1))
+		done
+		frost_file="${base}_${sequence}.txt"
+	fi
+	if ! mv "$temporary_file" "$frost_file"; then
+		rm -f "$temporary_file"
+		return 1
+	fi
 
-	# Only update the "last" symlink if the content actually changed
-	if [ -f "$last_file" ] && cmp -s "$frost_file" "$(resolve_symlink "$last_file" 2>/dev/null)"; then
+	temporary_link="$(mktemp "$dir/.frost-last.XXXXXX")" || {
 		rm -f "$frost_file"
-	else
-		ln -fs "$(basename "$frost_file")" "$last_file"
+		return 1
+	}
+	if ! rm -f "$temporary_link" || ! ln -s "$(basename "$frost_file")" "$temporary_link" || ! mv -f "$temporary_link" "$last_file"; then
+		rm -f "$temporary_link" "$frost_file"
+		return 1
 	fi
 
 	remove_old_backups
 }
 
 main() {
-	if ! acquire_lock; then
+	local lock_status=0
+	acquire_lock || lock_status=$?
+	if [ "$lock_status" -eq 1 ]; then
 		frost_log WARN "freeze skipped — lock held by another process"
 		return 0
+	elif [ "$lock_status" -ne 0 ]; then
+		frost_log ERROR "Glacier: failed to prepare save directory or lock file"
+		return 1
 	fi
 
 	local mode="manual"
@@ -163,7 +223,10 @@ main() {
 		display_message "Glacier: saving..."
 	fi
 
-	save_all
+	if ! save_all; then
+		frost_log ERROR "Freeze save failed"
+		return 1
+	fi
 
 	local sessions panes
 	sessions="$(tmux list-sessions 2>/dev/null | wc -l | tr -d ' ')"
