@@ -25,7 +25,7 @@ The public product name is Glacier. On-disk file names, option keys, and format 
 
 ## Requirements
 
-- tmux 3.0 or newer
+- tmux 3.0a or newer
 - bash
 - [TPM](https://github.com/tmux-plugins/tpm)
 
@@ -101,9 +101,17 @@ set -g @frost-delete-backup-after '30'  # default: 30
 
 # Restore pane titles on thaw ('on' or 'off')
 set -g @frost-restore-pane-title 'off'  # default: off
+
+# Confirm before restore when any session has more than one pane ('on' or 'off')
+set -g @frost-thaw-confirm 'off'       # default: off
 ```
 
 `@frost-dir` is validated before use. Empty values, the filesystem root, relative paths that do not expand to an absolute path, and values that contain newlines are rejected. If the directory exists and can be read but cannot be written, Glacier migrates frost save files once into a writable fallback under the default data path or, when that is also unusable, under the user cache directory, then uses that fallback for later freeze and thaw.
+
+
+`@frost-thaw-confirm` defaults to `off`. When set to `on`, the restore key checks every session on the current tmux server. If every session has exactly one pane, restore runs immediately. If any session has two or more panes, tmux shows a single status-line `confirm-before` prompt ending in `(y/n)`. Only `y` runs thaw once; any other key cancels (tmux `confirm-before` default) and leaves sessions unchanged, without an error in the pane. There is no separate force key: leave the option off for the previous confirm-free path. Auto-restore never uses this prompt.
+
+The confirm prompt appears on the tmux status line, not inside a pane or as a popup. If the status line is hidden, or no client is attached when the key runs, the prompt may be easy to miss or may not appear.
 
 ## Pane-local user options
 
@@ -111,7 +119,7 @@ During freeze, Glacier records a `pane_user_options` marker for every pane and o
 
 During thaw, panes that have a marker in the save file have their current local `@*` options replaced by the saved set. Options that appeared later on that pane are removed. Options that come from a higher scope stay in place. Older save files without markers leave current pane options untouched.
 
-If a saved pane target no longer exists, thaw logs a warning and continues successfully so other panes can still restore. Corrupt records for one pane preserve that pane's existing options and do not stop other panes. Freeze failures while listing, reading, encoding, or writing options abort the new snapshot and keep the previous `last` link.
+If a saved pane target no longer exists, thaw logs a warning and continues successfully so other panes can still restore. Corrupt option records for one pane preserve that pane's existing options and do not stop other panes. Invalid markers are logged as errors and ignored; a valid marker for the same pane still allows restoration if its option records are valid. Marker or option record validation errors make thaw return a nonzero exit status. Freeze failures while listing, reading, encoding, or writing options abort the new snapshot and keep the previous `last` link.
 
 ## Save file format
 
@@ -136,7 +144,7 @@ When the plugin loads, it registers a one-shot `session-created` hook. The first
 
 ## How auto-save works
 
-Auto-save is a background loop that sleeps for the configured interval and then runs a quiet freeze. The loop is started by `glacier.tmux` and is a child of the tmux server, so it exits when tmux exits. A PID file prevents duplicate loops after `tmux source`.
+Auto-save is a background loop started by `glacier.tmux` that runs a quiet freeze at the configured interval. It checks the original tmux server's PID every second and exits when that server exits. A PID file prevents duplicate loops after `tmux source`.
 
 ## Troubleshooting
 

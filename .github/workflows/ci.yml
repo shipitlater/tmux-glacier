@@ -26,13 +26,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-      - name: Linux에 tmux 설치
+      - name: Install tmux on Linux
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y tmux
-      - name: macOS에 tmux 설치
+      - name: Install tmux on macOS
         if: runner.os == 'macOS'
         run: brew install tmux
-      - name: 기존 테스트와 pane 옵션 테스트 실행
+      - name: Run core and pane option tests
         run: /bin/bash tests/run_tests.sh

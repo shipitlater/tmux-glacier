@@ -64,37 +64,49 @@ frost_dir_is_writable() {
   return 0
 }
 
-# Copy existing frost saves once from a readable source into a writable destination.
+# Copy snapshots for each source path and link to the save selected by the source's last.
 migrate_frost_dir_once() {
   local src="$1"
   local dest="$2"
   local marker="$dest/.frost-migrated-from"
-  local file base target
+  local file base target sequence source_last last_target='' temporary_link
 
   mkdir -p "$dest" || return 1
-  if [ -f "$marker" ]; then
+  if [ -f "$marker" ] && [ "$(cat "$marker")" = "$src" ]; then
     return 0
   fi
 
-  for file in "$src"/frost_*.txt; do
-    [ -e "$file" ] || continue
-    base="$(basename "$file")"
-    if [ ! -e "$dest/$base" ]; then
-      cp -p "$file" "$dest/$base" || return 1
+  if [ -L "$src/last" ] && [ ! -f "$src/last" ]; then
+    return 1
+  fi
+
+  for file in "$src"/frost_*.txt "$src/last"; do
+    [ -f "$file" ] || continue
+    if [ "$file" = "$src/last" ]; then
+      source_last="$(resolve_symlink "$file")" || return 1
+      base="$(basename "$source_last")"
+      [ "$base" != last ] || base=frost_migrated.txt
+    else
+      base="$(basename "$file")"
     fi
+    target="$dest/$base"
+    sequence=0
+    while [ -e "$target" ] || [ -L "$target" ]; do
+      cmp -s "$file" "$target" && break
+      sequence=$((sequence + 1))
+      target="$dest/${base%.txt}_${sequence}.txt"
+    done
+    if [ ! -e "$target" ]; then
+      cp -p "$file" "$target" || return 1
+    fi
+    [ "$file" != "$src/last" ] || last_target="$(basename "$target")"
   done
 
-  if [ -L "$src/last" ] || [ -f "$src/last" ]; then
-    if [ -L "$src/last" ]; then
-      target="$(readlink "$src/last")"
-      if [ -n "$target" ] && [ ! -e "$dest/last" ] && [ ! -L "$dest/last" ]; then
-        if [ -f "$dest/$target" ] || [ -f "$src/$target" ]; then
-          [ -f "$dest/$target" ] || cp -p "$src/$target" "$dest/$target" || return 1
-          ln -s "$target" "$dest/last" || return 1
-        fi
-      fi
-    elif [ -f "$src/last" ] && [ ! -e "$dest/last" ]; then
-      cp -p "$src/last" "$dest/last" || return 1
+  if [ -n "$last_target" ]; then
+    temporary_link="$(mktemp "$dest/.frost-last.XXXXXX")" || return 1
+    if ! rm -f "$temporary_link" || ! ln -s "$last_target" "$temporary_link" || ! mv -f "$temporary_link" "$dest/last"; then
+      rm -f "$temporary_link"
+      return 1
     fi
   fi
 
@@ -106,8 +118,19 @@ migrate_frost_dir_once() {
 # Prefer the configured path when writable; otherwise one-shot migrate to a fallback.
 frost_dir() {
   local configured expanded fallback
-  configured="$(get_tmux_option "@frost-dir" "$default_frost_dir")"
-  expanded="$(expand_frost_dir_setting "$configured")"
+  # Append a sentinel to distinguish newlines in the setting from the newline added by tmux.
+  if configured="$(tmux show-option -gv '@frost-dir' 2>/dev/null; setting_status=$?; printf '\034'; exit "$setting_status")"; then
+    configured="${configured%$'\034'}"
+    if [ -z "$configured" ]; then
+      configured="$default_frost_dir"
+    else
+      configured="${configured%$'\n'}"
+    fi
+  else
+    configured="$default_frost_dir"
+  fi
+  expanded="$(expand_frost_dir_setting "$configured"; setting_status=$?; printf '\034'; exit "$setting_status")" || return 1
+  expanded="${expanded%$'\034'}"
   if [ -n "$_frost_dir_cache" ] && [ "$_frost_dir_cache_key" = "$expanded" ]; then
     printf '%s\n' "$_frost_dir_cache"
     return 0
@@ -162,8 +185,8 @@ last_frost_file() {
 }
 
 # Display a message in the tmux status line.
-# display-message 호출 시 tmux의 현재 display-time 설정값을 그대로 사용한다.
-# 별도 duration을 지정하면 그 시간(ms) 동안 표시 후 복원한다.
+# Use tmux's current display-time setting as-is when calling display-message.
+# If a separate duration is specified, restore it after displaying for that duration (ms).
 display_message() {
   local message="$1"
   local display_duration="$2"
@@ -201,31 +224,32 @@ frost_log() {
 
 rotate_logs() {
   local dir
-  dir="$(frost_dir)"
+  dir="$(frost_dir)" || return 1
   find "$dir" -name "frost_*.log" -type f -mtime +10 -delete 2>/dev/null
 }
 
-# Acquire an exclusive lock (non-blocking). Returns 1 if lock held by another.
+# Return 1 if the lock is busy, or 2 if the save directory or lock file cannot be prepared.
 # Uses flock on fd 9 — released automatically when the process exits.
 acquire_lock() {
-  local lock_file
-  lock_file="$(frost_dir)/.frost.lock"
-  mkdir -p "$(frost_dir)"
+  local dir lock_file
+  dir="$(frost_dir)" || return 2
+  lock_file="$dir/.frost.lock"
+  mkdir -p "$dir" || return 2
 
-  # flock 명령이 제공되는 경우 flock 사용
+  # Use flock when the flock command is available.
   if command -v flock >/dev/null 2>&1; then
-    exec 9>"$lock_file"
+    exec 9>"$lock_file" || return 2
     flock -n 9 || return 1
   else
-    # flock이 없는 경우 (macOS 기본 환경 등) mkdir의 원자성을 이용한 디렉터리 락 사용
+    # If flock is unavailable (such as on macOS by default), use mkdir's atomicity for a directory lock.
     local lock_dir
-    lock_dir="$(frost_dir)/.frost.lock.d"
+    lock_dir="$dir/.frost.lock.d"
     if mkdir "$lock_dir" 2>/dev/null; then
       echo "$$" > "$lock_dir/pid"
       trap release_lock EXIT INT TERM
       return 0
     else
-      # 고아 락 검출 및 정리 (락을 잡은 프로세스가 이미 종료된 경우)
+      # Detect and clean up stale locks (when the process holding the lock has already exited).
       if [ -f "$lock_dir/pid" ]; then
         local lock_pid
         lock_pid="$(cat "$lock_dir/pid" 2>/dev/null)"
@@ -244,8 +268,9 @@ acquire_lock() {
 }
 
 release_lock() {
-  local lock_dir
-  lock_dir="$(frost_dir)/.frost.lock.d"
+  local dir lock_dir
+  dir="$(frost_dir)" || return 1
+  lock_dir="$dir/.frost.lock.d"
   if [ -d "$lock_dir" ]; then
     local lock_pid
     lock_pid="$(cat "$lock_dir/pid" 2>/dev/null)"
@@ -269,4 +294,88 @@ resolve_symlink() {
     done
     cd "$(dirname "$target")" 2>/dev/null && echo "$(pwd -P)/$(basename "$target")"
   )
+}
+
+# ── Auto-save script identity (path + inode/mtime) ─────────────────
+
+# Fingerprint a script as "inode:mtime" (portable BSD/GNU stat).
+# Empty output and non-zero status when the path is missing or unreadable.
+frost_script_fingerprint() {
+  local path="$1"
+  local inode mtime
+  if [ ! -e "$path" ]; then
+    printf '%s\n' ""
+    return 1
+  fi
+  if inode="$(stat -f '%i' "$path" 2>/dev/null)" && mtime="$(stat -f '%m' "$path" 2>/dev/null)"; then
+    printf '%s\n' "${inode}:${mtime}"
+    return 0
+  fi
+  if inode="$(stat -c '%i' "$path" 2>/dev/null)" && mtime="$(stat -c '%Y' "$path" 2>/dev/null)"; then
+    printf '%s\n' "${inode}:${mtime}"
+    return 0
+  fi
+  printf '%s\n' ""
+  return 1
+}
+
+# Persist absolute paths + fingerprints used when the auto-save loop started.
+# Sibling of .auto_save.pid so the pid file stays pid-only.
+write_auto_save_meta() {
+  local meta_file="$1"
+  local loop_script="$2"
+  local freeze_script="$3"
+  local loop_fp freeze_fp
+  loop_fp="$(frost_script_fingerprint "$loop_script")" || loop_fp=""
+  freeze_fp="$(frost_script_fingerprint "$freeze_script")" || freeze_fp=""
+  cat >"$meta_file" <<EOF
+loop_path=${loop_script}
+loop_fp=${loop_fp}
+freeze_path=${freeze_script}
+freeze_fp=${freeze_fp}
+EOF
+}
+
+# True when meta matches the current loop/freeze script paths and fingerprints.
+auto_save_meta_matches() {
+  local meta_file="$1"
+  local loop_script="$2"
+  local freeze_script="$3"
+  local stored_loop_path stored_loop_fp stored_freeze_path stored_freeze_fp
+  local cur_loop_fp cur_freeze_fp
+
+  [ -f "$meta_file" ] || return 1
+
+  stored_loop_path="$(grep '^loop_path=' "$meta_file" 2>/dev/null | head -1 | cut -d= -f2-)"
+  stored_loop_fp="$(grep '^loop_fp=' "$meta_file" 2>/dev/null | head -1 | cut -d= -f2-)"
+  stored_freeze_path="$(grep '^freeze_path=' "$meta_file" 2>/dev/null | head -1 | cut -d= -f2-)"
+  stored_freeze_fp="$(grep '^freeze_fp=' "$meta_file" 2>/dev/null | head -1 | cut -d= -f2-)"
+
+  [ -n "$stored_loop_path" ] && [ -n "$stored_loop_fp" ] || return 1
+  [ -n "$stored_freeze_path" ] && [ -n "$stored_freeze_fp" ] || return 1
+  [ "$stored_loop_path" = "$loop_script" ] || return 1
+  [ "$stored_freeze_path" = "$freeze_script" ] || return 1
+
+  cur_loop_fp="$(frost_script_fingerprint "$loop_script")" || return 1
+  cur_freeze_fp="$(frost_script_fingerprint "$freeze_script")" || return 1
+  [ "$stored_loop_fp" = "$cur_loop_fp" ] || return 1
+  [ "$stored_freeze_fp" = "$cur_freeze_fp" ] || return 1
+  return 0
+}
+
+# True when @frost-thaw-confirm is on and any session has other than exactly one pane.
+# Used only by the restore keybinding path; auto-restore never calls this.
+frost_thaw_needs_confirm() {
+  local enabled session count
+  enabled="$(get_tmux_option "@frost-thaw-confirm" "off")"
+  [ "$enabled" = "on" ] || return 1
+
+  while IFS= read -r session; do
+    [ -n "$session" ] || continue
+    count="$(tmux list-panes -s -t "$session" 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${count:-0}" -ne 1 ]; then
+      return 0
+    fi
+  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+  return 1
 }

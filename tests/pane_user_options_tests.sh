@@ -599,7 +599,7 @@ test_thaw_special_bytes() {
   freeze_test_setup || return 1
   local first name value escaped_name escaped_value i
   first="$(tmux list-panes -t freeze-options -F '#{pane_id}')" || return 1
-  # tmux 3.0의 기존 단일 pane 레이아웃 결함을 피하도록 두 pane으로 검증한다.
+  # Test with two panes to avoid the existing single-pane layout bug in tmux 3.0.
   tmux split-window -d -t "$first" 'sleep 60' || return 1
   value=$'한글\t"따옴표"\\역슬래시\n중간\n\n'
   for ((i=0; i<240; i++)); do value="${value}x"; done
@@ -840,6 +840,127 @@ test_frost_dir_guard_and_readonly_migrate() {
   freeze_test_cleanup
 }
 
+test_migration_selected_snapshot() {
+  local link_type
+  for link_type in relative absolute regular; do
+    freeze_test_setup || return 1
+    local pane ro snapshot fallback
+    local XDG_DATA_HOME="$freeze_test_dir/data"
+    local XDG_CACHE_HOME="$freeze_test_dir/cache"
+    export XDG_DATA_HOME XDG_CACHE_HOME
+    pane="$(tmux list-panes -t freeze-options -F '#{pane_id}')" || return 1
+    ro="$freeze_test_dir/readonly"
+    fallback="$XDG_DATA_HOME/tmux/glacier"
+    snapshot=frost_20261002T120000.txt
+    mkdir -p "$ro" "$fallback" || return 1
+    {
+      printf 'frost_version\t2\npane_user_options\tfreeze-options\t0\t0\n'
+      printf 'pane_user_option\tfreeze-options\t0\t0\tb64:QGtlZXA=\tb64:U09VUkNF\n'
+    } >"$ro/$snapshot"
+    {
+      printf 'frost_version\t2\npane_user_options\tfreeze-options\t0\t0\n'
+      printf 'pane_user_option\tfreeze-options\t0\t0\tb64:QGtlZXA=\tb64:T0xE\n'
+    } >"$fallback/$snapshot"
+    cp "$fallback/$snapshot" "$freeze_test_dir/previous-snapshot" || return 1
+    ln -s "$snapshot" "$fallback/last" || return 1
+    case "$link_type" in
+      relative) ln -s "$snapshot" "$ro/last" ;;
+      absolute) ln -s "$ro/$snapshot" "$ro/last" ;;
+      regular) cp "$ro/$snapshot" "$ro/last" ;;
+    esac
+    chmod a-w "$ro" || return 1
+    tmux set-option -g '@frost-dir' "$ro" || return 1
+    tmux set-option -p -t "$pane" '@keep' LIVE || return 1
+
+    check "Thaw succeeds after migrating $link_type last" run_real_thaw
+    check "Restore source option selected by $link_type last" pane_value_is "$pane" '@keep' SOURCE
+    check "Fallback matches source snapshot selected by $link_type last" same_file "$ro/last" "$fallback/last"
+    check "Preserve existing snapshot with a name collision for $link_type last" same_file "$fallback/$snapshot" "$freeze_test_dir/previous-snapshot"
+    check "Preserve source file for $link_type last" same_file "$ro/$snapshot" "$ro/last"
+
+    tmux set-option -p -t "$pane" '@keep' AFTER || return 1
+    check "Freeze to fallback succeeds after $link_type migration" run_real_freeze
+    tmux set-option -p -t "$pane" '@keep' LIVE || return 1
+    check "Thaw succeeds without repeating $link_type migration" run_real_thaw
+    check "Preserve subsequent save in $link_type fallback" pane_value_is "$pane" '@keep' AFTER
+    chmod u+w "$ro" || return 1
+    freeze_test_cleanup
+  done
+}
+
+test_migration_current_snapshot_retention() {
+  freeze_test_setup || return 1
+  local source_dir fallback snapshot i
+  local XDG_DATA_HOME="$freeze_test_dir/data"
+  export XDG_DATA_HOME
+  source_dir="$freeze_test_dir/saves"
+  fallback="$XDG_DATA_HOME/tmux/glacier"
+  tmux set-window-option -t freeze-options:0 automatic-rename off || return 1
+  tmux rename-window -t freeze-options:0 stable || return 1
+  run_real_freeze || return 1
+  snapshot="$(readlink "$source_dir/last")"
+  touch -t 202001010000 "$source_dir/$snapshot" || return 1
+  mkdir -p "$fallback" || return 1
+  for i in 1 2 3 4 5 6; do
+    printf 'frost_version\t1\n' >"$fallback/frost_other_$i.txt"
+  done
+  chmod a-w "$source_dir" || return 1
+  check 'Migrate old source and skip duplicate freeze successfully' run_real_freeze
+  check 'Duplicate freeze does not replace current last with a new file' test "$(readlink "$fallback/last")" = "$snapshot"
+  check 'Preserve old current snapshot during backup cleanup' same_file "$source_dir/last" "$fallback/last"
+  check 'Current last target exists' test -f "$fallback/last"
+  chmod u+w "$source_dir" || return 1
+  freeze_test_cleanup
+}
+
+test_migration_source_change() {
+  freeze_test_setup || return 1
+  local src fallback
+  fallback="$freeze_test_dir/fallback"
+  for src in first second; do
+    mkdir -p "$freeze_test_dir/$src" || return 1
+    printf '%s\n' "$src" >"$freeze_test_dir/$src/frost_saved.txt"
+    ln -s frost_saved.txt "$freeze_test_dir/$src/last" || return 1
+    check "Migrate $src source path successfully" migrate_frost_dir_once "$freeze_test_dir/$src" "$fallback"
+    check "Select last from $src source path" same_file "$freeze_test_dir/$src/last" "$fallback/last"
+  done
+  freeze_test_cleanup
+}
+
+test_frost_dir_raw_validation() {
+  freeze_test_setup || return 1
+  local configured plugin_dir
+  local default_frost_dir="$freeze_test_dir/default"
+  local default_frost_cache_dir="$freeze_test_dir/cache"
+  local _frost_dir_cache='' _frost_dir_cache_key=''
+  plugin_dir="$(cd "$SCRIPT_DIR/.." && pwd)"
+  cat >"$freeze_test_dir/bin/setsid" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$GLACIER_TEST_DIR/launches"
+EOF
+  chmod +x "$freeze_test_dir/bin/setsid" || return 1
+  tmux set-option -g '@frost-auto-restore' off || return 1
+  tmux set-option -g '@frost-auto-save-interval' 60 || return 1
+
+  for configured in '' "$freeze_test_dir/trailing"$'\n' "$freeze_test_dir/embedded"$'\n''path' "$freeze_test_dir/carriage"$'\r' relative/path /; do
+    tmux set-option -g '@frost-dir' "$configured" || return 1
+    check 'Reject invalid raw @frost-dir values' fails frost_dir >"$freeze_test_dir/dir-output" 2>"$freeze_test_dir/dir-errors"
+    check 'Freeze returns failure for invalid paths' fails run_real_freeze
+    check 'Thaw returns failure for invalid paths' fails run_real_thaw
+    check 'Plugin load returns failure for invalid paths' fails /bin/bash "$plugin_dir/glacier.tmux" >"$freeze_test_dir/plugin-output" 2>&1
+    check 'Prevent auto-save launch for invalid paths' test ! -e "$freeze_test_dir/launches"
+    check 'Invalid paths produce no directory output' is_empty "$freeze_test_dir/dir-output"
+  done
+  tmux set-option -g '@frost-auto-save-interval' 0 || return 1
+  check 'Stopping auto-save returns failure for invalid paths' fails /bin/bash "$plugin_dir/glacier.tmux" >"$freeze_test_dir/plugin-output" 2>&1
+  tmux set-option -gu '@frost-dir' || return 1
+  check 'Unset @frost-dir uses the default path' test "$(frost_dir)" = "$default_frost_dir"
+  tmux set-option -g '@frost-dir' "$freeze_test_dir/valid" || return 1
+  check 'Use valid absolute path unchanged' test "$(frost_dir)" = "$freeze_test_dir/valid"
+  check 'Do not create a save file in fallback' test ! -e "$default_frost_cache_dir/last"
+  freeze_test_cleanup
+}
+
 test_freeze_empty_line_guard() {
   freeze_test_setup || return 1
   local first snapshot
@@ -871,6 +992,10 @@ else
   run_freeze_test 'Orphan pane WARN succeeds' test_orphan_missing_pane_warn_success
   run_freeze_test 'frost_version compatibility' test_frost_version_write_and_compat
   run_freeze_test 'frost-dir guard and migration' test_frost_dir_guard_and_readonly_migrate
+  run_freeze_test 'Migration snapshot selection' test_migration_selected_snapshot
+  run_freeze_test 'Preserve current snapshot after migration' test_migration_current_snapshot_retention
+  run_freeze_test 'Migration source path change' test_migration_source_change
+  run_freeze_test 'Raw save path validation and failure propagation' test_frost_dir_raw_validation
   run_freeze_test 'Freeze empty-line guard' test_freeze_empty_line_guard
   run_freeze_test 'Thaw corrupt-pane isolation' test_corrupt_pane_isolation
   run_freeze_test 'Thaw corrupt-marker isolation' test_corrupt_marker_isolation

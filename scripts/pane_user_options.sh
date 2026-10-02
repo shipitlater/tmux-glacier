@@ -4,7 +4,7 @@
 # Sourced by freeze.sh and thaw.sh after helpers.sh.
 #
 
-# 실행 중 사용하는 Base64 디코더 옵션을 한 번 판별한다.
+# Determine the Base64 decoder options to use at runtime once.
 init_base64_decoder() {
   if [ -n "${BASE64_DECODER_FLAG:-}" ]; then
     return 0
@@ -20,13 +20,13 @@ init_base64_decoder() {
   fi
 }
 
-# 플랫폼별 줄바꿈을 제거하되 인코더의 종료 상태를 유지한다.
+# Remove platform-specific line breaks while preserving the encoder's exit status.
 encode_base64() (
   set -o pipefail
   base64 | tr -d '\r\n'
 )
 
-# 디코딩이 완전히 성공한 뒤에만 원본 바이트를 내보낸다.
+# Emit the original bytes only after decoding succeeds completely.
 decode_base64() {
   init_base64_decoder || return 1
 
@@ -57,7 +57,7 @@ decode_base64() {
   return "$__glacier_status"
 }
 
-# tmux argv의 마지막 세미콜론만 명령 구분에서 보호한다.
+# Protect only the final semicolon in tmux argv from command separation.
 escape_tmux_argument() {
   local __glacier_argument="$1"
   case "$__glacier_argument" in
@@ -66,13 +66,13 @@ escape_tmux_argument() {
   printf -v "$2" '%s' "$__glacier_argument"
 }
 
-# 이름에 대한 format 보호와 argv 보호를 각각 한 번 적용한다.
+# Apply format protection and argv protection to the name once each.
 prepare_tmux_option_name() {
   local __glacier_prepared_name="${1//#/##}"
   escape_tmux_argument "$__glacier_prepared_name" "$2"
 }
 
-# tmux가 덧붙인 출력용 개행 한 개만 제거한다.
+# Remove only the single output newline appended by tmux.
 capture_option_value() {
   local __glacier_target __glacier_name __glacier_output
   case "$2" in @*) ;; *) return 1 ;; esac
@@ -85,7 +85,7 @@ capture_option_value() {
   printf -v "$3" '%s' "$__glacier_output"
 }
 
-# Base64 필드를 개행 손실 없이 출력 변수로 복원한다.
+# Restore the Base64 field to an output variable without losing newlines.
 decode_option_field() {
   case "$1" in b64:*) ;; *) return 1 ;; esac
   init_base64_decoder || return 1
@@ -95,7 +95,7 @@ decode_option_field() {
   printf -v "$2" '%s' "$__glacier_decoded"
 }
 
-# 전체 표시와 이름 직접 조회의 정확한 출력 경계로 local 이름을 확정한다.
+# Determine the local name using exact output boundaries for the full listing and direct name lookup.
 list_pane_user_option_names() {
   local LC_ALL=C
   local __glacier_target __glacier_remaining __glacier_query __glacier_candidate

@@ -133,14 +133,17 @@ remove_old_backups() {
 	local delete_after
 	delete_after="$(get_tmux_option "@frost-delete-backup-after" "30")"
 	local dir
-	dir="$(frost_dir)"
+	dir="$(frost_dir)" || return 1
 
 	# Collect all frost save files, sorted newest-first, skip the 5 newest
 	# (mapfile is bash 4+; read into the array instead so this works on the
 	# /bin/bash 3.2 that ships with macOS)
 	local -a files
 	local file
+	local last_file="$dir/last"
 	while IFS= read -r file; do
+		# Preserve the file selected by last, including old saves imported by migration.
+		[ "$file" -ef "$last_file" ] && continue
 		files+=("$file")
 	done < <(ls -t "$dir"/frost_*.txt 2>/dev/null | tail -n +6)
 	[[ ${#files[@]} -eq 0 ]] && return
@@ -201,9 +204,14 @@ save_all() {
 }
 
 main() {
-	if ! acquire_lock; then
+	local lock_status=0
+	acquire_lock || lock_status=$?
+	if [ "$lock_status" -eq 1 ]; then
 		frost_log WARN "freeze skipped — lock held by another process"
 		return 0
+	elif [ "$lock_status" -ne 0 ]; then
+		frost_log ERROR "Glacier: failed to prepare save directory or lock file"
+		return 1
 	fi
 
 	local mode="manual"

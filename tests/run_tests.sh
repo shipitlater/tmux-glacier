@@ -705,7 +705,7 @@ test_locking() {
             fail "lock not acquired after release"
         fi
     else
-        # flock이 없을 때의 디렉터리 기반 락킹 테스트
+        # Test directory-based locking when flock is unavailable.
         local lock_dir="$SAVE_DIR/.frost.lock.d"
 
         # Take the lock in a subshell that holds it
@@ -915,6 +915,685 @@ test_multiple_cycles() {
     fi
 }
 
+
+test_thaw_confirm() {
+    section "Optional thaw confirm (@frost-thaw-confirm)"
+    local plugin_dir real_tmux
+    plugin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    # Absolute path before any tmux() override — needed by the confirm spy.
+    real_tmux="$(type -P tmux)"
+    if [ -z "$real_tmux" ] || [ ! -x "$real_tmux" ]; then
+        fail "could not resolve real tmux binary"
+        return
+    fi
+    # shellcheck source=../scripts/helpers.sh
+    source "$plugin_dir/scripts/helpers.sh"
+
+    # Keep helpers' tmux calls on the isolated socket for this section.
+    tmux() { command tmux -S "$SOCKET" "$@"; }
+
+    # ── Gate: option unset / off never confirms ─────────────────────
+    fresh_server
+    T set-option -g @frost-dir "$SAVE_DIR"
+    T split-window -t "$SESSION"
+    T set-option -gu @frost-thaw-confirm 2>/dev/null || true
+    if frost_thaw_needs_confirm; then
+        fail "unset option: needs_confirm unexpectedly true"
+    else
+        pass "unset option: no confirm even with multi-pane"
+    fi
+
+    T set-option -g @frost-thaw-confirm "off"
+    if frost_thaw_needs_confirm; then
+        fail "off: needs_confirm unexpectedly true"
+    else
+        pass "off: no confirm even with multi-pane"
+    fi
+
+    # ── Gate: on + every session exactly 1 pane → no confirm ────────
+    fresh_server
+    T set-option -g @frost-dir "$SAVE_DIR"
+    T set-option -g @frost-thaw-confirm "on"
+    TMUX="" T new-session -d -s "one-pane-b"
+    if frost_thaw_needs_confirm; then
+        fail "on + all 1-pane sessions: needs_confirm true"
+    else
+        pass "on + all 1-pane sessions: no confirm"
+    fi
+
+    # ── Gate: on + one multi-pane session → confirm (server-wide) ───
+    fresh_server
+    T set-option -g @frost-dir "$SAVE_DIR"
+    T set-option -g @frost-thaw-confirm "on"
+    T split-window -t "$SESSION"
+    TMUX="" T new-session -d -s "solo"
+    # Client-facing session is solo (1 pane), but server has multi-pane SESSION
+    if frost_thaw_needs_confirm; then
+        pass "on + any multi-pane session: confirm (server-wide)"
+    else
+        fail "on + multi-pane elsewhere: needs_confirm false"
+    fi
+
+    # ── Dynamic option reload ───────────────────────────────────────
+    T set-option -g @frost-thaw-confirm "off"
+    if frost_thaw_needs_confirm; then
+        fail "reload off: still needs confirm"
+    else
+        pass "reload off→ next check skips confirm"
+    fi
+    T set-option -g @frost-thaw-confirm "on"
+    if frost_thaw_needs_confirm; then
+        pass "reload on→ next check requires confirm"
+    else
+        fail "reload on: needs_confirm false"
+    fi
+
+    # ── Binding points at thaw-key.sh ───────────────────────────────
+    fresh_server
+    T set-option -g @frost-dir "$SAVE_DIR"
+    T set-option -g @frost-auto-save-interval "0"
+    T set-option -g @frost-auto-restore "off"
+    TMUX="${SOCKET},$$,0" /bin/bash "$plugin_dir/glacier.tmux" >/dev/null 2>&1
+    local bind_line
+    bind_line="$(T list-keys -T prefix | grep 'C-r' || true)"
+    if echo "$bind_line" | grep -q "thaw-key.sh"; then
+        pass "restore key binds thaw-key.sh"
+    else
+        fail "restore key binding missing thaw-key.sh: $bind_line"
+    fi
+    if echo "$bind_line" | grep -qE 'force|thaw-force'; then
+        fail "unexpected force binding present"
+    else
+        pass "no force-key binding added"
+    fi
+
+    local bi pi save_file
+    bi="$(base_idx)"
+    pi="$(T show -gv pane-base-index 2>/dev/null || echo 0)"
+    save_file="$SAVE_DIR/frost_confirm.txt"
+
+    write_confirm_fixture() {
+        mkdir -p "$SAVE_DIR"
+        {
+            echo "frost_version${d}2"
+            echo "pane${d}${SESSION}${d}${bi}${d}1${d}${pi}${d}t${d}:/tmp${d}1"
+            echo "pane${d}thawed-extra${d}${bi}${d}1${d}${pi}${d}t${d}:/tmp${d}1"
+            echo "window${d}${SESSION}${d}${bi}${d}:zsh${d}1${d}:*${d}tiled${d}:"
+            echo "window${d}thawed-extra${d}${bi}${d}:zsh${d}1${d}:*${d}tiled${d}:"
+            echo "state${d}${SESSION}${d}"
+        } > "$save_file"
+        ln -fs "$(basename "$save_file")" "$SAVE_DIR/last"
+    }
+
+    # ── off + multi-pane: thaw-key runs thaw with no prompt ─────────
+    fresh_server
+    T set-option -g @frost-dir "$SAVE_DIR"
+    write_confirm_fixture
+    T split-window -t "$SESSION"
+    T set-option -g @frost-thaw-confirm "off"
+    local before_sessions after_sessions
+    before_sessions="$(T list-sessions -F '#{session_name}' | sort | tr '\n' ',')"
+    TMUX="${SOCKET},$$,0" /bin/bash "$plugin_dir/scripts/thaw-key.sh" >/dev/null 2>&1
+    sleep 1
+    after_sessions="$(T list-sessions -F '#{session_name}' | sort | tr '\n' ',')"
+    if echo "$after_sessions" | grep -q "thawed-extra"; then
+        pass "off + multi-pane: thaw-key restored without prompt"
+    else
+        fail "off + multi-pane: thaw did not run (before=$before_sessions after=$after_sessions)"
+    fi
+
+    # ── on + all 1-pane: thaw-key restores without prompt ───────────
+    fresh_server
+    bi="$(base_idx)"
+    pi="$(T show -gv pane-base-index 2>/dev/null || echo 0)"
+    T set-option -g @frost-dir "$SAVE_DIR"
+    T set-option -g @frost-thaw-confirm "on"
+    write_confirm_fixture
+    TMUX="" T new-session -d -s "other-one"
+    TMUX="${SOCKET},$$,0" /bin/bash "$plugin_dir/scripts/thaw-key.sh" >/dev/null 2>&1
+    sleep 1
+    if T has-session -t "thawed-extra" 2>/dev/null; then
+        pass "on + all 1-pane: thaw-key restored without prompt"
+    else
+        fail "on + all 1-pane: thaw did not run"
+    fi
+
+    # ── on + multi-pane: confirm accept / reject via tmux spy ───────
+    fresh_server
+    bi="$(base_idx)"
+    pi="$(T show -gv pane-base-index 2>/dev/null || echo 0)"
+    T set-option -g @frost-dir "$SAVE_DIR"
+    T set-option -g @frost-thaw-confirm "on"
+    write_confirm_fixture
+    T split-window -t "$SESSION"
+
+    local spy_dir confirm_log
+    spy_dir="$SAVE_DIR/tmux-spy"
+    confirm_log="$SAVE_DIR/confirm.log"
+    mkdir -p "$spy_dir"
+    rm -f "$confirm_log"
+    cat > "$spy_dir/tmux" << SPY
+#!/bin/bash
+# Spy matches real confirm-before: the prompt is scheduled, and the command
+# argument runs only on accept. thaw-key must not treat our exit status as
+# an in-process decline or as a signal to exec thaw.sh itself.
+if [ "\${1:-}" = "confirm-before" ]; then
+  printf '%s\n' "\$*" >> "$confirm_log"
+  if [ "\${FROST_TEST_CONFIRM:-}" = "accept" ]; then
+    shift
+    while [ \$# -gt 0 ]; do
+      if [ "\$1" = "-p" ]; then
+        shift 2
+        continue
+      fi
+      break
+    done
+    # confirm-before keeps one command string and parses it on y.
+    # Passing that string as a single argv is "unknown command".
+    if [ \$# -eq 1 ]; then
+      eval "set -- \$1"
+    fi
+    exec "$real_tmux" -S "$SOCKET" "\$@"
+  fi
+  # Decline: command is not run. Non-zero matches a cancelled prompt.
+  exit 1
+fi
+exec "$real_tmux" -S "$SOCKET" "\$@"
+SPY
+    chmod +x "$spy_dir/tmux"
+
+    # Reject: sessions unchanged, confirm called once, thaw-key exits 0
+    local sessions_before panes_before reject_rc
+    sessions_before="$(T list-sessions -F '#{session_name}' | sort | tr '\n' ',')"
+    panes_before="$(T list-panes -a | wc -l | tr -d ' ')"
+    set +e
+    FROST_TEST_CONFIRM=reject PATH="$spy_dir:$PATH" TMUX="${SOCKET},$$,0" \
+        /bin/bash "$plugin_dir/scripts/thaw-key.sh" >/dev/null 2>&1
+    reject_rc=$?
+    set -e
+    sleep 0.3
+    local sessions_after panes_after confirm_count
+    sessions_after="$(T list-sessions -F '#{session_name}' | sort | tr '\n' ',')"
+    panes_after="$(T list-panes -a | wc -l | tr -d ' ')"
+    confirm_count=0
+    [ -f "$confirm_log" ] && confirm_count="$(wc -l < "$confirm_log" | tr -d ' ')"
+    if [ "$confirm_count" -eq 1 ]; then
+        pass "on + multi-pane: confirm-before exactly once (reject path)"
+    else
+        fail "on + multi-pane reject: confirm count=$confirm_count (expected 1)"
+    fi
+    if grep -q '(y/n)' "$confirm_log" 2>/dev/null; then
+        pass "confirm prompt includes (y/n)"
+    else
+        fail "confirm prompt missing (y/n): $(tr '\\n' ' ' < "$confirm_log" 2>/dev/null || true)"
+    fi
+    if [ "$reject_rc" -eq 0 ]; then
+        pass "confirm rejected: thaw-key exits 0 (silent cancel)"
+    else
+        fail "confirm rejected: thaw-key exited $reject_rc (expected 0)"
+    fi
+    if [ "$sessions_before" = "$sessions_after" ] && [ "$panes_before" = "$panes_after" ] \
+        && ! T has-session -t "thawed-extra" 2>/dev/null; then
+        pass "confirm rejected: no session/pane changes"
+    else
+        fail "confirm rejected: state changed ($sessions_before -> $sessions_after, panes $panes_before -> $panes_after)"
+    fi
+    if grep -q 'run-shell' "$confirm_log" 2>/dev/null && grep -q 'thaw\.sh' "$confirm_log" 2>/dev/null; then
+        pass "confirm schedules run-shell of thaw.sh (not an in-process decline)"
+    else
+        fail "confirm command missing run-shell thaw.sh: $(tr '\\n' ' ' < "$confirm_log" 2>/dev/null || true)"
+    fi
+    if grep -q 'thaw skipped — user declined confirm' "$SAVE_DIR"/frost_*.log 2>/dev/null; then
+        fail "confirm rejected: treated confirm-before status as in-process decline"
+    else
+        pass "confirm rejected: no in-process decline log"
+    fi
+    if grep -q 'thaw started' "$SAVE_DIR"/frost_*.log 2>/dev/null; then
+        fail "confirm rejected: thaw started anyway"
+    else
+        pass "confirm rejected: thaw.sh was not run"
+    fi
+
+    # Accept: thaw runs once
+    rm -f "$confirm_log"
+    local accept_rc
+    set +e
+    FROST_TEST_CONFIRM=accept PATH="$spy_dir:$PATH" TMUX="${SOCKET},$$,0" \
+        /bin/bash "$plugin_dir/scripts/thaw-key.sh" >/dev/null 2>&1
+    accept_rc=$?
+    set -e
+    local i=0 thaw_starts=0
+    while [ "$i" -lt 20 ]; do
+        if T has-session -t "thawed-extra" 2>/dev/null; then
+            break
+        fi
+        sleep 0.25
+        i=$((i + 1))
+    done
+    # run-shell is asynchronous; give the log line a moment after the session exists
+    sleep 0.3
+    confirm_count=0
+    [ -f "$confirm_log" ] && confirm_count="$(wc -l < "$confirm_log" | tr -d ' ')"
+    if [ "$confirm_count" -eq 1 ]; then
+        pass "on + multi-pane: confirm-before exactly once (accept path)"
+    else
+        fail "on + multi-pane accept: confirm count=$confirm_count (expected 1)"
+    fi
+    thaw_starts="$(grep -c 'thaw started' "$SAVE_DIR"/frost_*.log 2>/dev/null || true)"
+    thaw_starts="${thaw_starts:-0}"
+    if T has-session -t "thawed-extra" 2>/dev/null && [ "$thaw_starts" -eq 1 ]; then
+        pass "confirm accepted: scheduled command thawed once"
+    else
+        fail "confirm accepted: thaw starts=$thaw_starts (expected 1) thawed-extra=$(T has-session -t thawed-extra 2>/dev/null && echo yes || echo no)"
+    fi
+    if [ "$accept_rc" -eq 0 ]; then
+        pass "confirm accepted: thaw-key exits 0 after scheduling confirm"
+    else
+        fail "confirm accepted: thaw-key exited $accept_rc (expected 0)"
+    fi
+
+    # ── auto-restore never prompts ──────────────────────────────────
+    if grep -q 'thaw-key.sh' "$plugin_dir/scripts/auto-restore.sh"; then
+        fail "auto-restore.sh must not call thaw-key.sh"
+    else
+        pass "auto-restore.sh does not reference thaw-key.sh"
+    fi
+    if grep -q 'thaw\.sh' "$plugin_dir/scripts/auto-restore.sh"; then
+        pass "auto-restore.sh still invokes thaw.sh directly"
+    else
+        fail "auto-restore.sh missing thaw.sh invocation"
+    fi
+
+    fresh_server
+    bi="$(base_idx)"
+    pi="$(T show -gv pane-base-index 2>/dev/null || echo 0)"
+    T set-option -g @frost-dir "$SAVE_DIR"
+    T set-option -g @frost-thaw-confirm "on"
+    write_confirm_fixture
+    rm -f "$confirm_log"
+    # Fresh server has 1 pane → auto-restore should thaw with no confirm
+    FROST_TEST_CONFIRM=reject PATH="$spy_dir:$PATH" TMUX="${SOCKET},$$,0" \
+        /bin/bash "$plugin_dir/scripts/auto-restore.sh" "$plugin_dir" >/dev/null 2>&1 || true
+    sleep 1
+    if [ -f "$confirm_log" ]; then
+        fail "auto-restore invoked confirm-before with option on"
+    else
+        pass "auto-restore with option on: no confirm-before"
+    fi
+    if T has-session -t "thawed-extra" 2>/dev/null; then
+        pass "auto-restore still thaws on fresh server"
+    else
+        fail "auto-restore did not thaw on fresh server"
+    fi
+
+    # Non-fresh server: auto-restore must skip (existing multi-pane)
+    fresh_server
+    bi="$(base_idx)"
+    pi="$(T show -gv pane-base-index 2>/dev/null || echo 0)"
+    T set-option -g @frost-dir "$SAVE_DIR"
+    T set-option -g @frost-thaw-confirm "on"
+    write_confirm_fixture
+    T split-window -t "$SESSION"
+    local sessions_pre
+    sessions_pre="$(T list-sessions -F '#{session_name}' | sort | tr '\n' ',')"
+    TMUX="${SOCKET},$$,0" /bin/bash "$plugin_dir/scripts/auto-restore.sh" "$plugin_dir" >/dev/null 2>&1 || true
+    sleep 0.3
+    if T has-session -t "thawed-extra" 2>/dev/null; then
+        fail "auto-restore ran on non-fresh server"
+    else
+        pass "auto-restore fresh-only condition preserved"
+    fi
+    local sessions_post
+    sessions_post="$(T list-sessions -F '#{session_name}' | sort | tr '\n' ',')"
+    if [ "$sessions_pre" = "$sessions_post" ]; then
+        pass "non-fresh auto-restore: sessions unchanged"
+    else
+        fail "non-fresh auto-restore changed sessions"
+    fi
+
+    # ── frost_version header still accepted via thaw-key off path ───
+    fresh_server
+    bi="$(base_idx)"
+    pi="$(T show -gv pane-base-index 2>/dev/null || echo 0)"
+    T set-option -g @frost-dir "$SAVE_DIR"
+    T set-option -g @frost-thaw-confirm "off"
+    local v2="$SAVE_DIR/frost_v2_confirm.txt"
+    {
+        echo "frost_version${d}2"
+        echo "pane${d}v2sess${d}${bi}${d}1${d}${pi}${d}t${d}:/tmp${d}1"
+        echo "window${d}v2sess${d}${bi}${d}:zsh${d}1${d}:*${d}tiled${d}:"
+        echo "state${d}v2sess${d}"
+    } > "$v2"
+    ln -fs "$(basename "$v2")" "$SAVE_DIR/last"
+    TMUX="${SOCKET},$$,0" /bin/bash "$plugin_dir/scripts/thaw-key.sh" >/dev/null 2>&1
+    sleep 1
+    if T has-session -t "v2sess" 2>/dev/null; then
+        pass "frost_version 2 save still thaws via key path"
+    else
+        fail "frost_version 2 thaw via key path failed"
+    fi
+
+    unset -f tmux
+}
+
+
+test_auto_save_server_exit() {
+    section "Auto-save shutdown on server exit"
+    local plugin_dir pid_file meta_file loop_pid new_loop_pid server_pid retries child children
+    plugin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    fresh_server
+    T set-option -g @frost-dir "$SAVE_DIR"
+    T set-option -g @frost-auto-restore off
+    T set-option -g @frost-auto-save-interval 60
+    pid_file="$SAVE_DIR/.auto_save.pid"
+    meta_file="$SAVE_DIR/.auto_save.meta"
+    T run-shell "'$plugin_dir/glacier.tmux'"
+    loop_pid="$(cat "$pid_file")"
+    sleep 0.2
+    T kill-server
+    # Start a new server on the same socket immediately and check whether it reuses the old loop.
+    T -f /dev/null new-session -d -s "$SESSION" -x 200 -y 50
+    T set-option -g @frost-dir "$SAVE_DIR"
+    T set-option -g @frost-auto-restore off
+    T set-option -g @frost-auto-save-interval 60
+    T run-shell "'$plugin_dir/glacier.tmux'"
+    new_loop_pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ -n "$new_loop_pid" ] && [ "$new_loop_pid" != "$loop_pid" ] && kill -0 "$new_loop_pid" 2>/dev/null; then
+        pass "New server on the same socket starts a new auto-save loop"
+    else
+        fail "New server reused the previous server's auto-save loop"
+    fi
+    retries=0
+    while kill -0 "$loop_pid" 2>/dev/null && [ "$retries" -lt 30 ]; do
+        sleep 0.1
+        retries=$((retries + 1))
+    done
+    if ! kill -0 "$loop_pid" 2>/dev/null; then
+        pass "Loop exits within 3 seconds of server exit even with a 60-minute save interval"
+    else
+        fail "Auto-save loop is still running after server exit"
+        children="$(pgrep -P "$loop_pid" 2>/dev/null || true)"
+        kill "$loop_pid" 2>/dev/null || true
+        for child in $children; do kill "$child" 2>/dev/null || true; done
+    fi
+    if [ -n "$new_loop_pid" ] && [ "$(cat "$pid_file" 2>/dev/null)" = "$new_loop_pid" ] && [ -f "$meta_file" ]; then
+        pass "New loop's files survive the previous server's loop exit"
+    else
+        fail "Previous server's loop removed the new loop's files"
+    fi
+    T kill-server
+    retries=0
+    while [ -n "$new_loop_pid" ] && kill -0 "$new_loop_pid" 2>/dev/null && [ "$retries" -lt 30 ]; do
+        sleep 0.1
+        retries=$((retries + 1))
+    done
+    if [ -n "$new_loop_pid" ] && kill -0 "$new_loop_pid" 2>/dev/null; then
+        fail "Auto-save loop remains after the new server exits"
+        children="$(pgrep -P "$new_loop_pid" 2>/dev/null || true)"
+        kill "$new_loop_pid" 2>/dev/null || true
+        for child in $children; do kill "$child" 2>/dev/null || true; done
+    fi
+    if [ ! -e "$pid_file" ] && [ ! -e "$meta_file" ]; then
+        pass "Exited loop's PID and metadata files are removed"
+    else
+        fail "Exited loop's PID or metadata file remains"
+    fi
+
+    fresh_server
+    T set-option -g @frost-dir "$SAVE_DIR"
+    server_pid="$(T display-message -p '#{pid}')"
+    "$plugin_dir/scripts/auto_save_loop.sh" "$pid_file" 1 "$plugin_dir/scripts/freeze.sh" "$SOCKET" "$server_pid" &
+    loop_pid=$!
+    printf '%s\n' "$loop_pid" >"$pid_file"
+    printf 'original metadata\n' >"$meta_file"
+    retries=0
+    while [ ! -e "$SAVE_DIR/last" ] && [ "$retries" -lt 40 ]; do
+        sleep 0.1
+        retries=$((retries + 1))
+    done
+    if [ -e "$SAVE_DIR/last" ]; then
+        pass "Live server runs freeze at the configured interval"
+    else
+        fail "Auto-save failed to save while the server was running"
+    fi
+    # Simulate a new loop taking ownership of the same files.
+    printf '%s\n' "$$" >"$pid_file"
+    printf 'successor metadata\n' >"$meta_file"
+    T kill-server
+    retries=0
+    while kill -0 "$loop_pid" 2>/dev/null && [ "$retries" -lt 30 ]; do
+        sleep 0.1
+        retries=$((retries + 1))
+    done
+    if ! kill -0 "$loop_pid" 2>/dev/null; then
+        pass "Directly launched auto-save loop also exits when the server stops"
+    else
+        fail "Directly launched auto-save loop remains after server exit"
+        children="$(pgrep -P "$loop_pid" 2>/dev/null || true)"
+        kill "$loop_pid" 2>/dev/null || true
+        for child in $children; do kill "$child" 2>/dev/null || true; done
+    fi
+    wait "$loop_pid" 2>/dev/null || true
+    if [ "$(cat "$pid_file" 2>/dev/null)" = "$$" ] && [ "$(cat "$meta_file" 2>/dev/null)" = 'successor metadata' ]; then
+        pass "Preserve PID and metadata files owned by the successor loop"
+    else
+        fail "Previous loop deleted its successor's files"
+    fi
+}
+
+test_auto_save_restart_on_script_change() {
+    section "Auto-save restart on script fingerprint / path change"
+    local plugin_dir
+    plugin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    # shellcheck source=../scripts/helpers.sh
+    source "$plugin_dir/scripts/helpers.sh"
+
+    # Keep helpers' tmux calls on the isolated socket for this section.
+    tmux() { command tmux -S "$SOCKET" "$@"; }
+
+    fresh_server
+    T set-option -g @frost-dir "$SAVE_DIR"
+    T set-option -g @frost-auto-save-interval "60"
+    T set-option -g @frost-auto-restore "off"
+
+    local pid_file="$SAVE_DIR/.auto_save.pid"
+    local meta_file="$SAVE_DIR/.auto_save.meta"
+    local loop_script="$plugin_dir/scripts/auto_save_loop.sh"
+    local freeze_script="$plugin_dir/scripts/freeze.sh"
+
+    # ── Helper unit checks ─────────────────────────────────────────
+    local fp
+    fp="$(frost_script_fingerprint "$freeze_script")"
+    if [[ "$fp" == *:* ]] && [ -n "${fp%%:*}" ] && [ -n "${fp#*:}" ]; then
+        pass "frost_script_fingerprint returns inode:mtime"
+    else
+        fail "frost_script_fingerprint unexpected: '$fp'"
+    fi
+
+    write_auto_save_meta "$meta_file" "$loop_script" "$freeze_script"
+    if auto_save_meta_matches "$meta_file" "$loop_script" "$freeze_script"; then
+        pass "auto_save_meta_matches: fresh meta matches"
+    else
+        fail "auto_save_meta_matches: fresh meta should match"
+    fi
+    if auto_save_meta_matches "$meta_file" "/tmp/other-loop.sh" "$freeze_script"; then
+        fail "auto_save_meta_matches: path mismatch should fail"
+    else
+        pass "auto_save_meta_matches: path mismatch detected"
+    fi
+    # Stale fingerprint in meta
+    printf '%s\n' "loop_path=${loop_script}" "loop_fp=0:0" \
+        "freeze_path=${freeze_script}" "freeze_fp=0:0" > "$meta_file"
+    if auto_save_meta_matches "$meta_file" "$loop_script" "$freeze_script"; then
+        fail "auto_save_meta_matches: stale fp should fail"
+    else
+        pass "auto_save_meta_matches: stale fingerprint detected"
+    fi
+    if auto_save_meta_matches "$SAVE_DIR/.missing.meta" "$loop_script" "$freeze_script"; then
+        fail "auto_save_meta_matches: missing meta should fail"
+    else
+        pass "auto_save_meta_matches: missing meta fails"
+    fi
+    rm -f "$meta_file"
+
+    # ── Load plugin: start loop + write meta ─────────────────────
+    TMUX="${SOCKET},$$,0" /bin/bash "$plugin_dir/glacier.tmux" >/dev/null 2>&1
+    sleep 0.4
+
+    local pid1
+    if [ -f "$pid_file" ]; then
+        pid1="$(cat "$pid_file")"
+        pass "auto-save pid file created after load"
+    else
+        fail "auto-save pid file missing after load"
+        unset -f tmux
+        return
+    fi
+    if kill -0 "$pid1" 2>/dev/null &&
+        ps -p "$pid1" -o args= 2>/dev/null | grep -q "auto_save_loop"; then
+        pass "auto-save loop running after load (pid $pid1)"
+    else
+        fail "auto-save loop not running after load (pid '$pid1')"
+        unset -f tmux
+        return
+    fi
+    if [ -f "$meta_file" ] && auto_save_meta_matches "$meta_file" "$loop_script" "$freeze_script"; then
+        pass "auto-save meta written and matches current scripts"
+    else
+        fail "auto-save meta missing or mismatch after load: $(tr '\\n' ' ' < "$meta_file" 2>/dev/null || true)"
+    fi
+
+    # ── Unchanged reload: no PID churn ─────────────────────────────
+    TMUX="${SOCKET},$$,0" /bin/bash "$plugin_dir/glacier.tmux" >/dev/null 2>&1
+    sleep 0.3
+    local pid2
+    pid2="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ "$pid1" = "$pid2" ] && kill -0 "$pid1" 2>/dev/null; then
+        pass "unchanged fingerprint reload: same pid (no churn)"
+    else
+        fail "unchanged fingerprint reload: pid churn ($pid1 -> $pid2)"
+    fi
+
+    # ── Stale fingerprint in meta → restart ────────────────────────
+    printf '%s\n' "loop_path=${loop_script}" "loop_fp=0:0" \
+        "freeze_path=${freeze_script}" "freeze_fp=0:0" > "$meta_file"
+    TMUX="${SOCKET},$$,0" /bin/bash "$plugin_dir/glacier.tmux" >/dev/null 2>&1
+    sleep 0.4
+    local pid3
+    pid3="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ -n "$pid3" ] && [ "$pid3" != "$pid1" ]; then
+        pass "stale fingerprint: new loop pid ($pid1 -> $pid3)"
+    else
+        fail "stale fingerprint: expected new pid (still $pid3)"
+    fi
+    if ! kill -0 "$pid1" 2>/dev/null; then
+        pass "stale fingerprint: old loop stopped"
+    else
+        fail "stale fingerprint: old loop still alive (pid $pid1)"
+        kill "$pid1" 2>/dev/null || true
+    fi
+    if auto_save_meta_matches "$meta_file" "$loop_script" "$freeze_script"; then
+        pass "stale fingerprint: meta rewritten to current scripts"
+    else
+        fail "stale fingerprint: meta not rewritten"
+    fi
+
+    # ── In-place mtime change (git pull simulation) → restart ──────
+    local pid_before_touch="$pid3"
+    # Ensure mtime advances (some FS have 1s resolution)
+    sleep 1
+    touch "$freeze_script"
+    TMUX="${SOCKET},$$,0" /bin/bash "$plugin_dir/glacier.tmux" >/dev/null 2>&1
+    sleep 0.4
+    local pid4
+    pid4="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ -n "$pid4" ] && [ "$pid4" != "$pid_before_touch" ]; then
+        pass "freeze.sh mtime change: loop restarted ($pid_before_touch -> $pid4)"
+    else
+        fail "freeze.sh mtime change: pid unchanged ($pid_before_touch)"
+    fi
+    if ! kill -0 "$pid_before_touch" 2>/dev/null; then
+        pass "freeze.sh mtime change: old loop stopped"
+    else
+        fail "freeze.sh mtime change: old loop still alive"
+        kill "$pid_before_touch" 2>/dev/null || true
+    fi
+
+    # ── Path change via alternate plugin copy → restart ────────────
+    local alt_plugin pid_before_path
+    alt_plugin="$SAVE_DIR/alt-plugin"
+    pid_before_path="$pid4"
+    rm -rf "$alt_plugin"
+    mkdir -p "$alt_plugin/scripts"
+    cp "$plugin_dir/glacier.tmux" "$alt_plugin/"
+    cp "$plugin_dir/scripts/"*.sh "$alt_plugin/scripts/"
+    TMUX="${SOCKET},$$,0" /bin/bash "$alt_plugin/glacier.tmux" >/dev/null 2>&1
+    sleep 0.4
+    local pid5
+    pid5="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ -n "$pid5" ] && [ "$pid5" != "$pid_before_path" ]; then
+        pass "plugin path change: loop restarted ($pid_before_path -> $pid5)"
+    else
+        fail "plugin path change: pid unchanged ($pid_before_path)"
+    fi
+    if ! kill -0 "$pid_before_path" 2>/dev/null; then
+        pass "plugin path change: old loop stopped"
+    else
+        fail "plugin path change: old loop still alive"
+        kill "$pid_before_path" 2>/dev/null || true
+    fi
+    local alt_loop="$alt_plugin/scripts/auto_save_loop.sh"
+    local alt_freeze="$alt_plugin/scripts/freeze.sh"
+    if auto_save_meta_matches "$meta_file" "$alt_loop" "$alt_freeze"; then
+        pass "plugin path change: meta points at alternate plugin scripts"
+    else
+        fail "plugin path change: meta mismatch for alt plugin: $(tr '\\n' ' ' < "$meta_file" 2>/dev/null || true)"
+    fi
+    # New loop's argv should reference the alt freeze path
+    if ps -p "$pid5" -o args= 2>/dev/null | grep -q "$alt_freeze"; then
+        pass "new loop argv uses alternate freeze.sh"
+    else
+        # nohup/setsid may shorten args; check meta freeze_path instead as soft pass note
+        local meta_freeze
+        meta_freeze="$(grep '^freeze_path=' "$meta_file" | cut -d= -f2-)"
+        if [ "$meta_freeze" = "$alt_freeze" ]; then
+            pass "new loop meta freeze_path is alternate freeze.sh (argv truncated)"
+        else
+            fail "new loop not bound to alternate freeze.sh (args=$(ps -p "$pid5" -o args= 2>/dev/null))"
+        fi
+    fi
+
+    # ── Missing meta with live loop → restart ──────────────────────
+    local pid_before_missing="$pid5"
+    rm -f "$meta_file"
+    TMUX="${SOCKET},$$,0" /bin/bash "$alt_plugin/glacier.tmux" >/dev/null 2>&1
+    sleep 0.4
+    local pid6
+    pid6="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ -n "$pid6" ] && [ "$pid6" != "$pid_before_missing" ]; then
+        pass "missing meta: loop restarted ($pid_before_missing -> $pid6)"
+    else
+        fail "missing meta: expected restart (pid $pid_before_missing -> $pid6)"
+    fi
+    if [ -f "$meta_file" ]; then
+        pass "missing meta: meta rewritten after restart"
+    else
+        fail "missing meta: meta not rewritten"
+    fi
+
+    # Cleanup loop so later tests are not affected by long-interval daemon
+    if [ -n "$pid6" ]; then
+        kill "$pid6" 2>/dev/null || true
+        wait "$pid6" 2>/dev/null || true
+    fi
+    rm -f "$pid_file" "$meta_file"
+    # Disable for subsequent glacier.tmux loads in other tests
+    T set-option -g @frost-auto-save-interval "0"
+
+    unset -f tmux
+}
+
+
 # ════════════════════════════════════════════════════════════════════
 # Runner
 # ════════════════════════════════════════════════════════════════════
@@ -938,9 +1617,12 @@ test_state_line_captures_session
 test_thaw_empty_pane_title
 test_thaw_idempotent
 test_auto_save_background_loop
+test_auto_save_restart_on_script_change
+test_auto_save_server_exit
 test_locking
 test_idempotent_save
 test_multiple_cycles
+test_thaw_confirm
 
 if /bin/bash "$(dirname "${BASH_SOURCE[0]}")/pane_user_options_tests.sh"; then
     pass "pane user option integration tests"

@@ -152,7 +152,7 @@ restore_all_panes() {
 	fi
 }
 
-# 빈 필드까지 보존해 검증한 뒤 pane-local user option을 pane 단위로 교체한다.
+# After validating while preserving empty fields, replace pane-local user options on a per-pane basis.
 restore_pane_user_options() {
 	local save_file="$1" line remainder line_type key target pane_id inventory
 	local name value names encoded_name escaped_target escaped_name escaped_value
@@ -166,7 +166,7 @@ restore_pane_user_options() {
 		line_type="${line%%$'\t'*}"
 		case "$line_type" in pane_user_options|pane_user_option) ;; *) continue ;; esac
 
-		# IFS 공백 병합이나 별도 구분 문자 치환 없이 실제 탭만 분리한다.
+		# Split only on actual tabs, without IFS whitespace collapsing or replacing with another delimiter.
 		fields=()
 		remainder="$line"
 		while [[ "$remainder" == *$'\t'* ]]; do
@@ -214,7 +214,7 @@ restore_pane_user_options() {
 	done < "$save_file"
 
 	[ "${#keys[@]}" -gt 0 ] || return "$result"
-	# tmux target의 접두사·현재 pane 해석을 피하고 정확한 식별자만 pane_id에 연결한다.
+	# Avoid tmux target prefix and current-pane resolution; associate only the exact identifier with pane_id.
 	if ! inventory="$(tmux -u list-panes -a -F "#{session_name}${d}#{window_index}${d}#{pane_index}${d}#{pane_id}" 2>/dev/null)"; then
 		frost_log ERROR 'pane option restore: failed to list target panes'
 		return 1
@@ -342,7 +342,7 @@ restore_state() {
 
 main() {
 	local save_file
-	save_file="$(last_frost_file)"
+	save_file="$(last_frost_file)" || return 1
 
 	if [ ! -L "$save_file" ] && [ ! -f "$save_file" ]; then
 		frost_log ERROR "thaw failed — no save file found"
@@ -369,10 +369,15 @@ main() {
 		return 1
 	fi
 
-	if ! acquire_lock; then
+	local lock_status=0
+	acquire_lock || lock_status=$?
+	if [ "$lock_status" -eq 1 ]; then
 		frost_log WARN "thaw skipped — lock held by another process"
 		display_message "Glacier: another operation in progress"
 		return 0
+	elif [ "$lock_status" -ne 0 ]; then
+		frost_log ERROR "Glacier: failed to prepare save directory or lock file"
+		return 1
 	fi
 
 	frost_log INFO "thaw started from $(basename "$actual_file")"
