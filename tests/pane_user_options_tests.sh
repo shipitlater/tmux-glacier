@@ -929,7 +929,7 @@ test_migration_source_change() {
 
 test_frost_dir_raw_validation() {
   freeze_test_setup || return 1
-  local configured plugin_dir
+  local configured case_name plugin_dir
   local default_frost_dir="$freeze_test_dir/default"
   local default_frost_cache_dir="$freeze_test_dir/cache"
   local _frost_dir_cache='' _frost_dir_cache_key=''
@@ -942,14 +942,25 @@ EOF
   tmux set-option -g '@frost-auto-restore' off || return 1
   tmux set-option -g '@frost-auto-save-interval' 60 || return 1
 
-  for configured in '' "$freeze_test_dir/trailing"$'\n' "$freeze_test_dir/embedded"$'\n''path' "$freeze_test_dir/carriage"$'\r' relative/path /; do
+  for case_name in empty trailing-newline embedded-newline carriage-return embedded-carriage-return backslash-carriage-return relative root; do
+    case "$case_name" in
+      empty) configured='' ;;
+      trailing-newline) configured="$freeze_test_dir/trailing"$'\n' ;;
+      embedded-newline) configured="$freeze_test_dir/embedded"$'\n''path' ;;
+      carriage-return) configured="$freeze_test_dir/carriage"$'\r' ;;
+      embedded-carriage-return) configured="$freeze_test_dir/embedded"$'\r''path' ;;
+      backslash-carriage-return) configured="$freeze_test_dir/backslash\\"$'\r' ;;
+      relative) configured=relative/path ;;
+      root) configured=/ ;;
+    esac
+    rm -f "$freeze_test_dir/launches" || return 1
     tmux set-option -g '@frost-dir' "$configured" || return 1
-    check 'Reject invalid raw @frost-dir values' fails frost_dir >"$freeze_test_dir/dir-output" 2>"$freeze_test_dir/dir-errors"
-    check 'Freeze returns failure for invalid paths' fails run_real_freeze
-    check 'Thaw returns failure for invalid paths' fails run_real_thaw
-    check 'Plugin load returns failure for invalid paths' fails /bin/bash "$plugin_dir/glacier.tmux" >"$freeze_test_dir/plugin-output" 2>&1
-    check 'Prevent auto-save launch for invalid paths' test ! -e "$freeze_test_dir/launches"
-    check 'Invalid paths produce no directory output' is_empty "$freeze_test_dir/dir-output"
+    check "Reject invalid raw @frost-dir ($case_name)" fails frost_dir >"$freeze_test_dir/dir-output" 2>"$freeze_test_dir/dir-errors"
+    check "Freeze returns failure for invalid paths ($case_name)" fails run_real_freeze
+    check "Thaw returns failure for invalid paths ($case_name)" fails run_real_thaw
+    check "Plugin load returns failure for invalid paths ($case_name)" fails /bin/bash "$plugin_dir/glacier.tmux" >"$freeze_test_dir/plugin-output" 2>&1
+    check "Prevent auto-save launch for invalid paths ($case_name)" test ! -e "$freeze_test_dir/launches"
+    check "Invalid paths produce no directory output ($case_name)" is_empty "$freeze_test_dir/dir-output"
   done
   tmux set-option -g '@frost-auto-save-interval' 0 || return 1
   check 'Stopping auto-save returns failure for invalid paths' fails /bin/bash "$plugin_dir/glacier.tmux" >"$freeze_test_dir/plugin-output" 2>&1
@@ -957,6 +968,15 @@ EOF
   check 'Unset @frost-dir uses the default path' test "$(frost_dir)" = "$default_frost_dir"
   tmux set-option -g '@frost-dir' "$freeze_test_dir/valid" || return 1
   check 'Use valid absolute path unchanged' test "$(frost_dir)" = "$freeze_test_dir/valid"
+  for configured in "$freeze_test_dir/literal\\r" "$freeze_test_dir/literal\\\\r"; do
+    tmux set-option -g '@frost-dir' "$configured" || return 1
+    check 'Preserve literal backslash-r in valid paths' test "$(frost_dir)" = "$configured"
+  done
+  local LC_ALL=C
+  export LC_ALL
+  configured="$freeze_test_dir/한글"
+  tmux -u set-option -g '@frost-dir' "$configured" || return 1
+  check 'Preserve UTF-8 path outside tmux with C locale' test "$(TMUX='' frost_dir)" = "$configured"
   check 'Do not create a save file in fallback' test ! -e "$default_frost_cache_dir/last"
   freeze_test_cleanup
 }

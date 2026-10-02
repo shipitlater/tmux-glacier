@@ -117,14 +117,25 @@ migrate_frost_dir_once() {
 # Resolved save directory (protocol helpers keep the frost_* names).
 # Prefer the configured path when writable; otherwise one-shot migrate to a fallback.
 frost_dir() {
-  local configured expanded fallback
+  local configured expanded fallback escaped
+  local carriage_return_pattern='(^|[^\\])(\\\\)*\\r'
   # Append a sentinel to distinguish newlines in the setting from the newline added by tmux.
-  if configured="$(tmux show-option -gv '@frost-dir' 2>/dev/null; setting_status=$?; printf '\034'; exit "$setting_status")"; then
+  if configured="$(tmux -u show-option -gv '@frost-dir' 2>/dev/null; setting_status=$?; printf '\034'; exit "$setting_status")"; then
     configured="${configured%$'\034'}"
     if [ -z "$configured" ]; then
       configured="$default_frost_dir"
     else
       configured="${configured%$'\n'}"
+      # tmux 3.4 escapes CR in value-only output. Named output also escapes literal backslashes.
+      case "$configured" in
+        *'\r'*)
+          escaped="$(tmux -u show-option -g '@frost-dir' 2>/dev/null)" || return 1
+          if [[ "$escaped" =~ $carriage_return_pattern ]]; then
+            echo "Glacier: @frost-dir contains a newline" >&2
+            return 1
+          fi
+          ;;
+      esac
     fi
   else
     configured="$default_frost_dir"
