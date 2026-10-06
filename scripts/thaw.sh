@@ -6,8 +6,8 @@
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/helpers.sh
 source "$CURRENT_DIR/helpers.sh"
-# shellcheck source=scripts/pane_user_options.sh
-source "$CURRENT_DIR/pane_user_options.sh"
+# shellcheck source=scripts/user_options.sh
+source "$CURRENT_DIR/user_options.sh"
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -152,19 +152,35 @@ restore_all_panes() {
 	fi
 }
 
-# After validating while preserving empty fields, replace pane-local user options on a per-pane basis.
 restore_pane_user_options() {
-	local save_file="$1" line remainder line_type key target pane_id inventory
+	restore_user_options "$1" pane p
+}
+
+restore_window_user_options() {
+	restore_user_options "$1" window w
+}
+
+# Validate every record before replacing local options for each exact target.
+restore_user_options() {
+	local save_file="$1" scope="$2" option_scope="$3" line remainder line_type key target target_id inventory
+	local marker_fields option_fields inventory_format inventory_command
 	local name value names encoded_name escaped_target escaped_name escaped_value
 	local i j count field_count line_number=0 result=0 valid
 	local current_session current_window current_pane current_id
 	local -a fields keys markers corrupt owners saved_names saved_values current_names
 	keys=() markers=() corrupt=() owners=() saved_names=() saved_values=()
+	if [ "$scope" = pane ]; then
+		marker_fields=4 option_fields=6 inventory_command=list-panes
+		inventory_format="#{session_name}${d}#{window_index}${d}#{pane_index}${d}#{pane_id}"
+	else
+		marker_fields=3 option_fields=5 inventory_command=list-windows
+		inventory_format="#{session_name}${d}#{window_index}${d}#{window_id}"
+	fi
 
 	while IFS= read -r line || [ -n "$line" ]; do
 		line_number=$((line_number + 1))
 		line_type="${line%%$'\t'*}"
-		case "$line_type" in pane_user_options|pane_user_option) ;; *) continue ;; esac
+		case "$line_type" in "${scope}_user_options"|"${scope}_user_option") ;; *) continue ;; esac
 
 		# Split only on actual tabs, without IFS whitespace collapsing or replacing with another delimiter.
 		fields=()
@@ -178,19 +194,26 @@ restore_pane_user_options() {
 		valid=true
 		[ -n "${fields[1]:-}" ] || valid=false
 		case "${fields[2]:-}" in ''|*[!0-9]*) valid=false ;; esac
-		case "${fields[3]:-}" in ''|*[!0-9]*) valid=false ;; esac
+		if [ "$scope" = pane ]; then
+			case "${fields[3]:-}" in ''|*[!0-9]*) valid=false ;; esac
+		fi
 		if [ "$valid" = false ]; then
-			frost_log ERROR "pane option restore: invalid identifier at line ${line_number}"
+			frost_log ERROR "${scope} option restore: invalid identifier at line ${line_number}"
 			result=1
 			continue
 		fi
-		if [ "$line_type" = pane_user_options ] && [ "$field_count" -ne 4 ]; then
-			frost_log ERROR "pane option restore: marker validation failed at line ${line_number}"
+		if [ "$line_type" = "${scope}_user_options" ] && [ "$field_count" -ne "$marker_fields" ]; then
+			frost_log ERROR "${scope} option restore: marker validation failed at line ${line_number}"
 			result=1
 			continue
 		fi
 
-		key="${fields[1]}${d}${fields[2]}${d}${fields[3]}"
+		key="${fields[1]}${d}${fields[2]}"
+		target="${fields[1]}:${fields[2]}"
+		if [ "$scope" = pane ]; then
+			key="${key}${d}${fields[3]}"
+			target="${target}.${fields[3]}"
+		fi
 		count=${#keys[@]}
 		for ((i = 0; i < count; i++)); do
 			[ "${keys[i]}" = "$key" ] && break
@@ -198,49 +221,55 @@ restore_pane_user_options() {
 		if [ "$i" -eq "$count" ]; then
 			keys[i]="$key" markers[i]=false corrupt[i]=false
 		fi
-		target="${fields[1]}:${fields[2]}.${fields[3]}"
-		if [ "$line_type" = pane_user_options ]; then
+		if [ "$line_type" = "${scope}_user_options" ]; then
 			markers[i]=true
-		elif [ "$line_type" = pane_user_option ] && [ "$field_count" -eq 6 ] &&
-			decode_option_field "${fields[4]}" name && [[ "$name" == @* ]] &&
-			decode_option_field "${fields[5]}" value; then
+		elif [ "$line_type" = "${scope}_user_option" ] && [ "$field_count" -eq "$option_fields" ] &&
+			decode_option_field "${fields[marker_fields]}" name && [[ "$name" == @* ]] &&
+			decode_option_field "${fields[marker_fields+1]}" value; then
 			j=${#owners[@]}
 			owners[j]="$i" saved_names[j]="$name" saved_values[j]="$value"
 		else
 			corrupt[i]=true
 			result=1
-			frost_log ERROR "pane option restore: ${target} record validation failed (line ${line_number})"
+			frost_log ERROR "${scope} option restore: ${target} record validation failed (line ${line_number})"
 		fi
 	done < "$save_file"
 
 	[ "${#keys[@]}" -gt 0 ] || return "$result"
-	# Avoid tmux target prefix and current-pane resolution; associate only the exact identifier with pane_id.
-	if ! inventory="$(tmux -u list-panes -a -F "#{session_name}${d}#{window_index}${d}#{pane_index}${d}#{pane_id}" 2>/dev/null)"; then
-		frost_log ERROR 'pane option restore: failed to list target panes'
+	# Avoid tmux prefix and current-target resolution; use only an exact path match.
+	if ! inventory="$(tmux -u "$inventory_command" -a -F "$inventory_format" 2>/dev/null)"; then
+		frost_log ERROR "${scope} option restore: failed to list target ${scope}s"
 		return 1
 	fi
 	for ((i = 0; i < ${#keys[@]}; i++)); do
 		IFS=$'\t' read -r current_session current_window current_pane <<<"${keys[i]}"
-		target="${current_session}:${current_window}.${current_pane}"
+		target="${current_session}:${current_window}"
+		[ "$scope" != pane ] || target="${target}.${current_pane}"
 		if [ "${markers[i]}" = false ]; then
-			frost_log WARN "pane option restore: ignoring ${target} record without a valid marker"
+			frost_log WARN "${scope} option restore: ignoring ${target} record without a valid marker"
 			result=1
 			continue
 		fi
 		[ "${corrupt[i]}" = false ] || continue
-		pane_id=''
+		target_id=''
 		while IFS=$'\t' read -r current_session current_window current_pane current_id; do
-			if [ "${current_session}${d}${current_window}${d}${current_pane}" = "${keys[i]}" ]; then
-				pane_id="$current_id"
+			key="${current_session}${d}${current_window}"
+			if [ "$scope" = pane ]; then
+				key="${key}${d}${current_pane}"
+			else
+				current_id="$current_pane"
+			fi
+			if [ "$key" = "${keys[i]}" ]; then
+				target_id="$current_id"
 				break
 			fi
 		done <<<"$inventory"
-		if [ -z "$pane_id" ]; then
-			frost_log WARN "pane option restore: no target pane for ${target} (orphan thaw)"
+		if [ -z "$target_id" ]; then
+			frost_log WARN "${scope} option restore: no target ${scope} for ${target} (orphan thaw)"
 			continue
 		fi
-		if ! names="$(list_pane_user_option_names "$pane_id" 2>/dev/null)"; then
-			frost_log ERROR "pane option restore: failed to list local names for ${target}"
+		if ! names="$(list_user_option_names "$target_id" "$option_scope" 2>/dev/null)"; then
+			frost_log ERROR "${scope} option restore: failed to list local names for ${target}"
 			result=1
 			continue
 		fi
@@ -255,16 +284,16 @@ restore_pane_user_options() {
 			current_names[${#current_names[@]}]="$name"
 		done <<<"$names"
 		if [ "$valid" = false ]; then
-			frost_log ERROR "pane option restore: failed to decode local names for ${target}"
+			frost_log ERROR "${scope} option restore: failed to decode local names for ${target}"
 			result=1
 			continue
 		fi
 
-		escape_tmux_argument "$pane_id" escaped_target
+		escape_tmux_argument "$target_id" escaped_target
 		for name in "${current_names[@]}"; do
 			prepare_tmux_option_name "$name" escaped_name
-			if ! tmux -u set-option -up -t "$escaped_target" "$escaped_name" 2>/dev/null; then
-				frost_log ERROR "pane option restore: failed to delete local options for ${target}"
+			if ! tmux -u set-option "-u${option_scope}" -t "$escaped_target" "$escaped_name" 2>/dev/null; then
+				frost_log ERROR "${scope} option restore: failed to delete local options for ${target}"
 				result=1
 				valid=false
 				break
@@ -275,8 +304,8 @@ restore_pane_user_options() {
 			[ "${owners[j]}" = "$i" ] || continue
 			prepare_tmux_option_name "${saved_names[j]}" escaped_name
 			escape_tmux_argument "${saved_values[j]}" escaped_value
-			if ! tmux -u set-option -p -t "$escaped_target" "$escaped_name" "$escaped_value" 2>/dev/null; then
-				frost_log ERROR "pane option restore: failed to set saved options for ${target}"
+			if ! tmux -u set-option "-${option_scope}" -t "$escaped_target" "$escaped_name" "$escaped_value" 2>/dev/null; then
+				frost_log ERROR "${scope} option restore: failed to set saved options for ${target}"
 				result=1
 			fi
 		done
@@ -359,11 +388,11 @@ main() {
 		return 1
 	fi
 
-	# Verify version header: accept frost_version 1 or 2 only.
+	# Verify the version before changing tmux state.
 	local first_line version_field version_value
 	first_line="$(head -1 "$actual_file")"
 	IFS=$'\t' read -r version_field version_value _ <<<"$first_line"
-	if [ "$version_field" != "frost_version" ] || { [ "$version_value" != "1" ] && [ "$version_value" != "2" ]; }; then
+	if [ "$version_field" != "frost_version" ] || { [ "$version_value" != "1" ] && [ "$version_value" != "2" ] && [ "$version_value" != "3" ]; }; then
 		frost_log ERROR "thaw failed — unsupported frost_version: ${version_value:-missing} ($actual_file)"
 		display_message "Glacier: unsupported save version!"
 		return 1
@@ -386,6 +415,7 @@ main() {
 
 	local option_status=0
 	restore_all_panes "$actual_file"
+	restore_window_user_options "$actual_file" || option_status=1
 	restore_pane_user_options "$actual_file" || option_status=1
 	restore_window_properties "$actual_file"
 	restore_active_panes "$actual_file"
@@ -393,8 +423,8 @@ main() {
 	restore_state "$actual_file"
 
 	if [ "$option_status" -ne 0 ]; then
-		frost_log ERROR 'partial thaw restore: failed to restore some pane options'
-		display_message 'Glacier: some pane options could not be restored; check the logs'
+		frost_log ERROR 'partial thaw restore: failed to restore some window or pane options'
+		display_message 'Glacier: some window or pane options could not be restored; check the logs'
 		return 1
 	fi
 

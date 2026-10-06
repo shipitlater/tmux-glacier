@@ -1630,6 +1630,12 @@ else
     fail "pane user option integration tests"
 fi
 
+if /bin/bash "$(dirname "${BASH_SOURCE[0]}")/window_user_options_tests.sh"; then
+    pass "window user option integration tests"
+else
+    fail "window user option integration tests"
+fi
+
 echo ""
 echo -e "${YELLOW}── Summary ──${NC}"
 echo -e "  ${GREEN}Passed${NC}: $PASS_COUNT"

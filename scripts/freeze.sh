@@ -6,8 +6,8 @@
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/helpers.sh
 source "$CURRENT_DIR/helpers.sh"
-# shellcheck source=scripts/pane_user_options.sh
-source "$CURRENT_DIR/pane_user_options.sh"
+# shellcheck source=scripts/user_options.sh
+source "$CURRENT_DIR/user_options.sh"
 
 # if "quiet" the script produces no tmux messages
 SCRIPT_OUTPUT="$1"
@@ -107,6 +107,31 @@ dump_pane_user_options() {
 	done <<< "$panes"
 }
 
+dump_window_user_options() {
+	local LC_ALL=C
+	local windows window_id session_name window_index
+	local names encoded_name name value encoded_value
+	windows="$(set -o pipefail; tmux -u list-windows -a -F "#{session_name}${d}#{window_index}${d}#{window_id}" 2>/dev/null | sort -t "$d" -k1,1 -k2,2n)" || return 1
+	[ -n "$windows" ] || return 0
+
+	while IFS="$d" read -r session_name window_index window_id || [ -n "$session_name$window_index$window_id" ]; do
+		if [ -z "$session_name$window_index$window_id" ]; then
+			continue
+		fi
+		[ -n "$window_id" ] || return 1
+		names="$(list_window_user_option_names "$window_id")" || return 1
+		printf 'window_user_options%s%s%s%s\n' "$d" "$session_name" "$d" "$window_index" || return 1
+		[ -n "$names" ] || continue
+		while IFS= read -r encoded_name || [ -n "$encoded_name" ]; do
+			[ -n "$encoded_name" ] || continue
+			decode_option_field "$encoded_name" name || return 1
+			capture_option_value "$window_id" "$name" value w || return 1
+			encoded_value="$(printf '%s' "$value" | encode_base64)" || return 1
+			printf 'window_user_option%s%s%s%s%s%s%sb64:%s\n' "$d" "$session_name" "$d" "$window_index" "$d" "$encoded_name" "$d" "$encoded_value" || return 1
+		done <<< "$names"
+	done <<< "$windows"
+}
+
 dump_windows() (
 	set -o pipefail
 	tmux list-windows -a -F "$(window_format)" |
@@ -161,13 +186,17 @@ save_all() {
 	mkdir -p "$dir" || return 1
 	temporary_file="$(mktemp "$dir/.frost-save.XXXXXX")" || return 1
 
-	if ! {
-		printf 'frost_version%s2\n' "$d" &&
+	# Bash 3.2 does not invert a compound command's redirection failure with !.
+	if {
+		printf 'frost_version%s3\n' "$d" &&
 		dump_panes &&
 		dump_pane_user_options &&
+		dump_window_user_options &&
 		dump_windows &&
 		dump_state
 	} > "$temporary_file"; then
+		:
+	else
 		rm -f "$temporary_file"
 		return 1
 	fi
