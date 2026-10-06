@@ -19,7 +19,7 @@ The public product name is Glacier. On-disk file names, option keys, and format 
 - Deduplicated saves: identical content does not create a new file.
 - Backup retention: old saves are removed after a configurable age while keeping the newest few.
 - Locking so concurrent freeze and thaw do not race.
-- Window-local and pane-local user option persistence: `@*` options set directly on a window or pane are saved and restored separately. Inherited options and other built-in options are not part of the snapshot.
+- Window-local and pane-local user option persistence: all `@*` user options set directly on a window or pane are saved and restored separately, regardless of their names or purpose. Inherited options and other built-in options are not part of the snapshot.
 - Save format version `frost_version` is written as `3`. Thaw accepts versions `1`, `2`, and `3` and rejects any other version.
 - If the configured save directory is readable but not writable, Glacier performs a one-shot migrate of existing frost save files into a writable fallback directory and continues there. Invalid or dangerous `@frost-dir` values are rejected early.
 
@@ -42,7 +42,7 @@ Reload tmux and press `prefix + I` to install. TPM loads the plugin through the 
 To pin a release tag:
 
 ```tmux
-set -g @plugin 'shipitlater/tmux-glacier#v1.1'
+set -g @plugin 'shipitlater/tmux-glacier#v1.2.0'
 ```
 
 Pinned installs do not move when you press `prefix + U`. Change the tag and reinstall to upgrade.
@@ -59,7 +59,7 @@ The verbs **save** and **restore** are the user-facing actions. **Freeze** and *
 ## What is saved
 
 - All sessions, windows, and panes
-- Window layouts and names
+- Window layouts and built-in window names
 - Pane working directories and titles
 - Active window and pane selections
 - Client session state
@@ -115,9 +115,22 @@ set -g @frost-thaw-confirm 'off'       # default: off
 
 The confirm prompt appears on the tmux status line, not inside a pane or as a popup. If the status line is hidden, or no client is attached when the key runs, the prompt may be easy to miss or may not appear.
 
-## Window and pane user options
+## Window-local and pane-local user options
+
+Glacier persists arbitrary user options whose names begin with `@`, set directly on a window with `set-option -w` or on a pane with `set-option -p`. Names and values are treated as data without option-specific behavior.
+
+For example, these options are saved and restored independently at their respective scopes:
+
+```bash
+tmux set-option -w -t my-session:1 @project 'api'
+tmux set-option -w -t my-session:1 @workflow 'review'
+tmux set-option -w -t my-session:1 @counter '7'
+tmux set-option -p -t my-session:1.0 @project 'worker'
+```
 
 During freeze, Glacier records a `window_user_options` marker for every session/window path and a `pane_user_options` marker for every pane, including targets with no local user options. Each local `@*` option gets a `window_user_option` or `pane_user_option` record. Names and values are stored as `b64:` Base64 fields so empty values, spaces, newlines, and non-ASCII names stay exact. Window and pane options with the same name stay separate.
+
+Built-in window names, layouts, and `automatic-rename` are stored separately in `window` records.
 
 During thaw, targets with a valid marker have their current local `@*` options replaced by the saved set. A marker without option records clears that target's local user options. Options from higher scopes stay in place. Files without a marker for a target leave its local options untouched. Thaw resolves session names and indices exactly to current window or pane IDs. Duplicate markers replace the set once; duplicate names apply the last saved value, regardless of marker placement.
 

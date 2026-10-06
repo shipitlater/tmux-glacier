@@ -107,6 +107,7 @@ dump_pane_user_options() {
 	done <<< "$panes"
 }
 
+# Save all directly set @* user options without interpreting their names.
 dump_window_user_options() {
 	local LC_ALL=C
 	local windows window_id session_name window_index

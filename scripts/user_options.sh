@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# user_options.sh — pane-local and window-local @* option helpers.
+# user_options.sh — pane-local and window-local @* user option helpers.
 # Sourced by freeze.sh and thaw.sh after helpers.sh.
 #
 

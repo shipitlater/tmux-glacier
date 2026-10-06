@@ -410,7 +410,7 @@ test_round_trip_multi_session() {
 }
 
 test_window_names_restored() {
-    section "Window names"
+    section "Built-in window names"
     fresh_server
 
     local bi
@@ -427,7 +427,7 @@ test_window_names_restored() {
     do_thaw "$save_file"
     do_apply_layouts "$save_file"
 
-    # Apply window names from save file
+    # Apply built-in window names from save file.
     while IFS=$'\t' read -r lt ses win wname wact wfl wlay auto; do
         [ "$lt" = "window" ] || continue
         wname="${wname#:}"
