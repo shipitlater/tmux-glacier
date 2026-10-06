@@ -19,8 +19,8 @@ The public product name is Glacier. On-disk file names, option keys, and format 
 - Deduplicated saves: identical content does not create a new file.
 - Backup retention: old saves are removed after a configurable age while keeping the newest few.
 - Locking so concurrent freeze and thaw do not race.
-- Pane-local user option persistence: options set directly on a pane with `@*` names are saved and restored per pane. Inherited global, session, or window options and built-in pane options are not part of the snapshot.
-- Save format version `frost_version` is written as `2`. Thaw accepts versions `1` and `2` and rejects any other version.
+- Window-local and pane-local user option persistence: `@*` options set directly on a window or pane are saved and restored separately. Inherited options and other built-in options are not part of the snapshot.
+- Save format version `frost_version` is written as `3`. Thaw accepts versions `1`, `2`, and `3` and rejects any other version.
 - If the configured save directory is readable but not writable, Glacier performs a one-shot migrate of existing frost save files into a writable fallback directory and continues there. Invalid or dangerous `@frost-dir` values are rejected early.
 
 ## Requirements
@@ -64,6 +64,7 @@ The verbs **save** and **restore** are the user-facing actions. **Freeze** and *
 - Active window and pane selections
 - Client session state
 - The `automatic-rename` window option
+- Window-local `@*` user options that were set on the window itself, including empty values
 - Pane-local `@*` user options that were set on the pane itself, including empty values
 
 ## What is not saved
@@ -73,8 +74,9 @@ The verbs **save** and **restore** are the user-facing actions. **Freeze** and *
 - Environment variables
 - Pane contents
 - Option names or values that contain a `NUL` byte
-- Options inherited from global, session, or window scope
-- Built-in pane options that are not user `@*` options
+- Global and session options, and options inherited into windows or panes
+- Built-in window and pane options other than `automatic-rename`
+- Hooks and linked-window connections
 
 ## Options
 
@@ -113,28 +115,30 @@ set -g @frost-thaw-confirm 'off'       # default: off
 
 The confirm prompt appears on the tmux status line, not inside a pane or as a popup. If the status line is hidden, or no client is attached when the key runs, the prompt may be easy to miss or may not appear.
 
-## Pane-local user options
+## Window and pane user options
 
-During freeze, Glacier records a `pane_user_options` marker for every pane and one `pane_user_option` line for each local `@*` option on that pane. Names and values are stored as `b64:` Base64 fields so empty values, spaces, newlines, and non-ASCII names stay exact.
+During freeze, Glacier records a `window_user_options` marker for every session/window path and a `pane_user_options` marker for every pane, including targets with no local user options. Each local `@*` option gets a `window_user_option` or `pane_user_option` record. Names and values are stored as `b64:` Base64 fields so empty values, spaces, newlines, and non-ASCII names stay exact. Window and pane options with the same name stay separate.
 
-During thaw, panes that have a marker in the save file have their current local `@*` options replaced by the saved set. Options that appeared later on that pane are removed. Options that come from a higher scope stay in place. Older save files without markers leave current pane options untouched.
+During thaw, targets with a valid marker have their current local `@*` options replaced by the saved set. A marker without option records clears that target's local user options. Options from higher scopes stay in place. Files without a marker for a target leave its local options untouched. Thaw resolves session names and indices exactly to current window or pane IDs. Duplicate markers replace the set once; duplicate names apply the last saved value, regardless of marker placement.
 
-If a saved pane target no longer exists, thaw logs a warning and continues successfully so other panes can still restore. Corrupt option records for one pane preserve that pane's existing options and do not stop other panes. Invalid markers are logged as errors and ignored; a valid marker for the same pane still allows restoration if its option records are valid. Marker or option record validation errors make thaw return a nonzero exit status. Freeze failures while listing, reading, encoding, or writing options abort the new snapshot and keep the previous `last` link.
+If a saved target no longer exists, thaw logs a warning and continues successfully. Corrupt option records preserve that target's existing options while other windows and panes still restore. Invalid markers are logged as errors and ignored; a valid marker for the same target still allows restoration if its option records are valid. Records without valid markers, validation errors, and lookup/unset/set failures make thaw return a nonzero status. Command failures can leave a target partly changed; thaw does not roll back. Logs omit option values and raw tmux errors. Freeze failures while listing, reading, encoding, or writing options abort the new snapshot and keep the previous snapshot and `last` link.
 
 ## Save file format
 
 Saves are tab-separated text files. New saves start with:
 
 ```text
-frost_version<TAB>2
+frost_version<TAB>3
 pane<TAB>session<TAB>window_idx<TAB>win_active<TAB>pane_idx<TAB>title<TAB>:path<TAB>pane_active
 pane_user_options<TAB>session<TAB>window_idx<TAB>pane_idx
 pane_user_option<TAB>session<TAB>window_idx<TAB>pane_idx<TAB>b64:name<TAB>b64:value
+window_user_options<TAB>session<TAB>window_idx
+window_user_option<TAB>session<TAB>window_idx<TAB>b64:name<TAB>b64:value
 window<TAB>session<TAB>window_idx<TAB>:name<TAB>win_active<TAB>:flags<TAB>layout<TAB>auto_rename
 state<TAB>client_session<TAB>client_last_session
 ```
 
-`<TAB>` is a single tab character. Thaw accepts `frost_version` values `1` and `2`. Any other version is rejected with an error. Version `1` files without pane option markers remain readable and do not change pane-local options.
+`<TAB>` is a single tab character. Thaw accepts `frost_version` values `1`, `2`, and `3`. Any other version is rejected before tmux state changes. Version `1` and `2` files without window option markers remain readable and leave window-local options untouched; the same rule applies to missing pane markers. Older readers reject version `3`. After downgrading, select a retained version `1` or `2` snapshot with `last`; Glacier does not convert snapshots automatically.
 
 Files are named `frost_YYYYMMDDTHHMMSS.txt`. A `last` symlink points at the newest save. When two different saves would share the same timestamp, a numeric suffix such as `_1` is added. The default directory is `~/.local/share/tmux/glacier`.
 

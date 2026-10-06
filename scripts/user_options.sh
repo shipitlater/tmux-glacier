@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# pane_user_options.sh — pane-local @* option codec and enumeration helpers.
+# user_options.sh — pane-local and window-local @* option helpers.
 # Sourced by freeze.sh and thaw.sh after helpers.sh.
 #
 
@@ -74,11 +74,11 @@ prepare_tmux_option_name() {
 
 # Remove only the single output newline appended by tmux.
 capture_option_value() {
-  local __glacier_target __glacier_name __glacier_output
+  local __glacier_target __glacier_name __glacier_output __glacier_scope="${4:-p}"
   case "$2" in @*) ;; *) return 1 ;; esac
   escape_tmux_argument "$1" __glacier_target
   prepare_tmux_option_name "$2" __glacier_name
-  __glacier_output="$(tmux -u show-options -pv -t "$__glacier_target" "$__glacier_name"; __glacier_status=$?; printf '\034'; exit "$__glacier_status")" || return 1
+  __glacier_output="$(tmux -u show-options "-${__glacier_scope}v" -t "$__glacier_target" "$__glacier_name" 2>/dev/null; __glacier_status=$?; printf '\034'; exit "$__glacier_status")" || return 1
   __glacier_output="${__glacier_output%$'\034'}"
   case "$__glacier_output" in *$'\n') ;; *) return 1 ;; esac
   __glacier_output="${__glacier_output%$'\n'}"
@@ -97,12 +97,21 @@ decode_option_field() {
 
 # Determine the local name using exact output boundaries for the full listing and direct name lookup.
 list_pane_user_option_names() {
+  list_user_option_names "$1" p
+}
+
+list_window_user_option_names() {
+  list_user_option_names "$1" w
+}
+
+list_user_option_names() {
   local LC_ALL=C
+  local __glacier_scope="$2"
   local __glacier_target __glacier_remaining __glacier_query __glacier_candidate
   local __glacier_prepared __glacier_previous='' __glacier_result='' __glacier_encoded
   local __glacier_index __glacier_found
   escape_tmux_argument "$1" __glacier_target
-  __glacier_remaining="$(tmux -u show-options -p -t "$__glacier_target"; __glacier_status=$?; printf '\034'; exit "$__glacier_status")" || return 1
+  __glacier_remaining="$(tmux -u show-options "-$__glacier_scope" -t "$__glacier_target" 2>/dev/null; __glacier_status=$?; printf '\034'; exit "$__glacier_status")" || return 1
   __glacier_remaining="${__glacier_remaining%$'\034'}"
 
   if [[ "$__glacier_remaining" != @* ]]; then
@@ -121,7 +130,7 @@ list_pane_user_option_names() {
         continue
       fi
       prepare_tmux_option_name "$__glacier_candidate" __glacier_prepared
-      __glacier_query="$(tmux -u show-options -p -t "$__glacier_target" "$__glacier_prepared" 2>/dev/null; __glacier_status=$?; printf '\034'; exit "$__glacier_status")" || continue
+      __glacier_query="$(tmux -u show-options "-$__glacier_scope" -t "$__glacier_target" "$__glacier_prepared" 2>/dev/null; __glacier_status=$?; printf '\034'; exit "$__glacier_status")" || continue
       __glacier_query="${__glacier_query%$'\034'}"
       case "$__glacier_query" in *$'\n') ;; *) continue ;; esac
       [ "${__glacier_query:0:${#__glacier_candidate}}" = "$__glacier_candidate" ] || continue

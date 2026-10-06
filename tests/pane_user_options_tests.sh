@@ -5,8 +5,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../scripts/helpers.sh
 source "$SCRIPT_DIR/../scripts/helpers.sh"
-# shellcheck source=../scripts/pane_user_options.sh
-source "$SCRIPT_DIR/../scripts/pane_user_options.sh"
+# shellcheck source=../scripts/user_options.sh
+source "$SCRIPT_DIR/../scripts/user_options.sh"
 
 passed=0
 failed=0
@@ -227,13 +227,31 @@ freeze_test_setup() {
 case "${GLACIER_FAIL_MODE:-}" in
   query) case " $* " in *' show-options -pv '*) exit 37 ;; esac ;;
   dump) case " $* " in *' list-panes -a '*) exit 38 ;; esac ;;
+  window-query) case " $* " in *' show-options -wv '*) printf 'hidden-diagnostic\n' >&2; exit 37 ;; esac ;;
+  window-dump) case " $* " in *' list-windows -a '*) exit 38 ;; esac ;;
+  window-list) case " $* " in *' show-options -w '*) exit 39 ;; esac ;;
 esac
+if [ "${1:-}" = -u ] && [ "${2:-}" = show-options ] && [ "${3:-}" = -w ] && [ "$#" -eq 5 ] && [ "${5:-}" = "${GLACIER_FAIL_WINDOW:-}" ] && [ "${GLACIER_FAIL_MODE:-}" = thaw-window-list ]; then
+  printf '@partial value\n'
+  exit 40
+fi
 if [ "${1:-}" = -u ] && [ "${2:-}" = show-options ] && [ "${3:-}" = -p ] && [ "$#" -eq 5 ] && [ "${5:-}" = "${GLACIER_FAIL_PANE:-}" ] && [ "${GLACIER_FAIL_MODE:-}" = thaw-list ]; then
   printf '@부분 값\n'
   exit 40
 fi
 if [ "${1:-}" = -u ] && [ "${2:-}" = set-option ]; then
   case "${3:-}" in
+    -uw|-w)
+      if [ -n "${GLACIER_TRACE:-}" ]; then
+        printf '%s\t%s\t%s\n' "$3" "$5" "$6" >>"$GLACIER_TRACE"
+      fi
+      if [ "${5:-}" = "${GLACIER_FAIL_WINDOW:-}" ]; then
+        case "${GLACIER_FAIL_MODE:-}:$3:${6:-}" in
+          thaw-window-unset:-uw:*) printf 'hidden-diagnostic\n' >&2; exit 41 ;;
+          thaw-window-set:-w:@fail) printf 'hidden-diagnostic\n' >&2; exit 42 ;;
+        esac
+      fi
+      ;;
     -up|-p)
       if [ -n "${GLACIER_TRACE:-}" ]; then
         printf '%s\t%s\t%s\n' "$3" "$5" "$6" >>"$GLACIER_TRACE"
@@ -296,7 +314,7 @@ freeze_test_cleanup() {
   fi
   TMUX="${freeze_test_original_tmux:-}"
   export TMUX
-  unset GLACIER_TRACE GLACIER_FAIL_PANE GLACIER_FAIL_MODE GLACIER_REAL_TMUX GLACIER_REAL_BASE64 GLACIER_TEST_SOCKET GLACIER_TEST_DIR freeze_test_dir freeze_test_original_path freeze_test_original_tmux
+  unset GLACIER_TRACE GLACIER_FAIL_PANE GLACIER_FAIL_WINDOW GLACIER_FAIL_MODE GLACIER_REAL_TMUX GLACIER_REAL_BASE64 GLACIER_TEST_SOCKET GLACIER_TEST_DIR freeze_test_dir freeze_test_original_path freeze_test_original_tmux
 }
 
 run_real_freeze() {
@@ -786,9 +804,9 @@ test_frost_version_write_and_compat() {
   local first snapshot
   first="$(tmux list-panes -t freeze-options -F '#{pane_id}')" || return 1
   tmux -u set-option -p -t "$first" '@ver' V2 || return 1
-  check 'Freeze succeeds (version 2)' run_real_freeze
+  check 'Freeze succeeds (version 3)' run_real_freeze
   snapshot="$(resolve_symlink "$freeze_test_dir/saves/last")"
-  check 'New snapshot has frost_version=2' test "$(head -1 "$snapshot")" = $'frost_version\t2'
+  check 'New snapshot has frost_version=3' test "$(head -1 "$snapshot")" = $'frost_version\t3'
   write_thaw_snapshot <<EOF || return 1
 pane_user_options	freeze-options	0	0
 pane_user_option	freeze-options	0	0	b64:QHZlcg==	b64:VjE=
@@ -796,7 +814,7 @@ EOF
   # write_thaw_snapshot writes frost_version 1 header
   check 'Version 1 Thaw succeeds' run_real_thaw
   check 'Restore version 1 option' pane_value_is "$first" '@ver' V1
-  printf 'frost_version\t3\n' >"$freeze_test_dir/saves/manual.txt"
+  printf 'frost_version\t4\n' >"$freeze_test_dir/saves/manual.txt"
   ln -sf manual.txt "$freeze_test_dir/saves/last"
   check 'Reject unknown version' fails run_real_thaw
   check 'Log unsupported version' grep -q 'unsupported frost_version' "$freeze_test_dir/saves/"*.log
@@ -993,6 +1011,10 @@ test_freeze_empty_line_guard() {
   check 'Options recorded after empty-line guard' grep -q $'pane_user_option\t' "$snapshot"
   freeze_test_cleanup
 }
+
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  return 0
+fi
 
 if [ "$#" -gt 0 ]; then
   for test_function in "$@"; do

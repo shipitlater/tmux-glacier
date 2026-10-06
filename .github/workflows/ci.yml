@@ -19,7 +19,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y shellcheck
       - name: Lint scripts
-        run: shellcheck -x --severity=warning scripts/*.sh tests/run_tests.sh tests/pane_user_options_tests.sh glacier.tmux
+        run: shellcheck -x --severity=warning scripts/*.sh tests/*.sh glacier.tmux
 
   test:
     strategy:
@@ -36,5 +36,5 @@ jobs:
       - name: Install tmux on macOS
         if: runner.os == 'macOS'
         run: brew install tmux
-      - name: Run core and pane option tests
+      - name: Run core, pane, and window option tests
         run: /bin/bash tests/run_tests.sh
