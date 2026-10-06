@@ -36,5 +36,5 @@ jobs:
       - name: Install tmux on macOS
         if: runner.os == 'macOS'
         run: brew install tmux
-      - name: Run core, pane, and window option tests
+      - name: Run core, pane user option, and window user option tests
         run: /bin/bash tests/run_tests.sh

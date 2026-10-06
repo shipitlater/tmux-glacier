@@ -42,15 +42,15 @@ test_window_freeze_records() {
   check 'One marker per window path regardless of pane count' test "$(awk -F '\t' '$1 == "window_user_options" {n++} END {print n+0}' "$snapshot")" -eq 3
   check 'Keep empty window marker' grep -q $'^window_user_options\tfreeze-options\t7$' "$snapshot"
   check 'Window marker and option field counts' awk -F '\t' '$1 == "window_user_options" && NF != 3 {exit 1} $1 == "window_user_option" && NF != 5 {exit 1}' "$snapshot"
-  check 'Persist only three local window options' test "$(awk -F '\t' '$1 == "window_user_option" {n++} END {print n+0}' "$snapshot")" -eq 3
-  check 'Window and pane values are separate' grep -q $'^window_user_option\tfreeze-options\t0\tb64:QHNoYXJlZA==\tb64:d2luZG93$' "$snapshot"
-  check 'Other session keeps its separate window value' grep -q $'^window_user_option\tother-options\t0\tb64:QHNoYXJlZA==\tb64:b3RoZXI=$' "$snapshot"
+  check 'Persist only three local window user options' test "$(awk -F '\t' '$1 == "window_user_option" {n++} END {print n+0}' "$snapshot")" -eq 3
+  check 'Window and pane user option values are separate' grep -q $'^window_user_option\tfreeze-options\t0\tb64:QHNoYXJlZA==\tb64:d2luZG93$' "$snapshot"
+  check 'Other session keeps its separate window user option value' grep -q $'^window_user_option\tother-options\t0\tb64:QHNoYXJlZA==\tb64:b3RoZXI=$' "$snapshot"
   count="$(find "$freeze_test_dir/saves" -name 'frost_*.txt' | wc -l | tr -d ' ')"
   check 'Identical windows Freeze succeeds' run_real_freeze
   check 'Identical options do not add snapshots' test "$(find "$freeze_test_dir/saves" -name 'frost_*.txt' | wc -l | tr -d ' ')" -eq "$count"
   tmux set-option -w -t "$first" '@shared' changed || return 1
-  check 'Changed window value Freeze succeeds' run_real_freeze
-  check 'Window change adds one snapshot' test "$(find "$freeze_test_dir/saves" -name 'frost_*.txt' | wc -l | tr -d ' ')" -eq "$((count + 1))"
+  check 'Changed window user option value Freeze succeeds' run_real_freeze
+  check 'Window user option change adds one snapshot' test "$(find "$freeze_test_dir/saves" -name 'frost_*.txt' | wc -l | tr -d ' ')" -eq "$((count + 1))"
   freeze_test_cleanup
 }
 
@@ -68,7 +68,7 @@ test_window_linked_paths() {
   check 'Linked path has the same local option record' grep -q $'^window_user_option\tlinked-options\t4\tb64:QGxpbmtlZA==\tb64:c2F2ZWQ=$' "$snapshot"
   tmux set-option -w -t "$first" '@linked' OLD || return 1
   check 'Thaw existing linked window paths' run_real_thaw
-  check 'Restore shared window option once per path' window_value_is "$first" '@linked' saved
+  check 'Restore shared window user option once per path' window_value_is "$first" '@linked' saved
   check 'Keep existing link identity' test "$(tmux display-message -p -t linked-options:4 '#{window_id}')" = "$first"
   freeze_test_cleanup
 }
@@ -96,20 +96,20 @@ test_window_replace_and_scope() {
   tmux set-option -p -t "$pane" '@shared' OLD || return 1
   tmux set-option -w -t "$third" '@shared' OLD || return 1
   check 'Thaw restores both option scopes' run_real_thaw
-  check 'Restore local window value' window_value_is "$first" '@shared' window
-  check 'Restore local pane value' pane_value_is "$pane" '@shared' pane
+  check 'Restore local window user option value' window_value_is "$first" '@shared' window
+  check 'Restore local pane user option value' pane_value_is "$pane" '@shared' pane
   check 'Restore same index in similar session separately' window_value_is "$third" '@shared' other-session
   check 'Preserve global value' test "$(tmux show-options -gv '@shared')" = global
   check 'Preserve session value' test "$(tmux show-options -v -t freeze-options '@shared')" = session
-  check 'Preserve global window value' test "$(tmux show-options -gwv '@shared')" = global-window
-  check 'Remove stale local window option' window_option_absent "$first" '@stale'
-  check 'Empty window marker removes all local options' window_option_absent "$second" '@stale'
+  check 'Preserve global window user option value' test "$(tmux show-options -gwv '@shared')" = global-window
+  check 'Remove stale local window user option' window_option_absent "$first" '@stale'
+  check 'Empty window marker removes all local user options' window_option_absent "$second" '@stale'
   check 'Empty window keeps inherited options visible' tmux show-options -wA -t "$second" '@shared'
   check 'Keep empty value as a local option' tmux show-options -w -t "$first" '@empty'
-  check 'Restore empty window value' window_value_is "$first" '@empty' ''
+  check 'Restore empty window user option value' window_value_is "$first" '@empty' ''
   tmux set-option -w -t "$second" '@stale' again || return 1
   check 'Repeated Thaw succeeds' run_real_thaw
-  check 'Repeated Thaw removes stale window option' window_option_absent "$second" '@stale'
+  check 'Repeated Thaw removes stale window user option' window_option_absent "$second" '@stale'
   check 'Repeated Thaw keeps window count' test "$(tmux list-windows -t freeze-options | wc -l | tr -d ' ')" -eq 2
   check 'Repeated Thaw keeps pane count' test "$(tmux list-panes -a | wc -l | tr -d ' ')" -eq 3
   freeze_test_cleanup
@@ -160,7 +160,7 @@ test_window_legacy_targets_and_duplicates() {
   printf 'frost_version\t4\nwindow_user_options\tfreeze-options\t0\n' >"$freeze_test_dir/saves/manual.txt"
   : >"$GLACIER_TRACE"
   check 'Unsupported version fails before mutation' fails run_real_thaw
-  check 'Unsupported version preserves window options' window_value_is "$first" '@foo' B
+  check 'Unsupported version preserves window user options' window_value_is "$first" '@foo' B
   check 'Unsupported version issues no writes' is_empty "$GLACIER_TRACE"
   freeze_test_cleanup
 }
@@ -375,7 +375,7 @@ test_window_server_restart() {
   check 'Restore window scope on new ID' window_value_is "$first" '@shared' window
   check 'Restore pane scope on new ID' pane_value_is "$pane" '@shared' pane
   check 'Restore empty window set' window_option_absent "$second" '@shared'
-  check 'Restore saved window name' test "$(tmux display-message -p -t "$first" '#{window_name}')" = saved-name
+  check 'Restore saved built-in window name' test "$(tmux display-message -p -t "$first" '#{window_name}')" = saved-name
   check 'Restore automatic-rename' test "$(tmux show-options -wv -t "$first" automatic-rename)" = off
   check 'Restore saved window layout geometry' test "$(tmux list-panes -t "$first" -F '#{pane_left},#{pane_top},#{pane_width},#{pane_height}')" = "$layout"
   check 'Restore both nonzero window indices' test "$(tmux list-windows -t freeze-options -F '#{window_index}')" = $'3\n7'
@@ -390,15 +390,15 @@ if [ "$#" -gt 0 ]; then
     run_freeze_test "$test_function" "$test_function"
   done
 else
-  run_freeze_test 'Window Freeze records' test_window_freeze_records
+  run_freeze_test 'Window user option Freeze records' test_window_freeze_records
   run_freeze_test 'Linked window paths' test_window_linked_paths
-  run_freeze_test 'Window replacement and scope' test_window_replace_and_scope
-  run_freeze_test 'Window legacy targets and duplicates' test_window_legacy_targets_and_duplicates
-  run_freeze_test 'Window corrupt record isolation' test_window_corrupt_records
-  run_freeze_test 'Window command failures' test_window_command_failures
-  run_freeze_test 'Window Freeze failures' test_window_freeze_failures
-  run_freeze_test 'Window special bytes' test_window_special_bytes
-  run_freeze_test 'Window server restart' test_window_server_restart
+  run_freeze_test 'Window user option replacement and scope' test_window_replace_and_scope
+  run_freeze_test 'Window user option legacy targets and duplicates' test_window_legacy_targets_and_duplicates
+  run_freeze_test 'Window user option corrupt record isolation' test_window_corrupt_records
+  run_freeze_test 'Window user option command failures' test_window_command_failures
+  run_freeze_test 'Window user option Freeze failures' test_window_freeze_failures
+  run_freeze_test 'Window user option special bytes' test_window_special_bytes
+  run_freeze_test 'Window user options after server restart' test_window_server_restart
 fi
 printf 'Results: %s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

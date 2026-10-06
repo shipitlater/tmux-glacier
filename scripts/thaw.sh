@@ -160,7 +160,7 @@ restore_window_user_options() {
 	restore_user_options "$1" window w
 }
 
-# Validate every record before replacing local options for each exact target.
+# Validate every record before replacing local @* user options for each exact target.
 restore_user_options() {
 	local save_file="$1" scope="$2" option_scope="$3" line remainder line_type key target target_id inventory
 	local marker_fields option_fields inventory_format inventory_command
@@ -198,12 +198,12 @@ restore_user_options() {
 			case "${fields[3]:-}" in ''|*[!0-9]*) valid=false ;; esac
 		fi
 		if [ "$valid" = false ]; then
-			frost_log ERROR "${scope} option restore: invalid identifier at line ${line_number}"
+			frost_log ERROR "${scope} user option restore: invalid identifier at line ${line_number}"
 			result=1
 			continue
 		fi
 		if [ "$line_type" = "${scope}_user_options" ] && [ "$field_count" -ne "$marker_fields" ]; then
-			frost_log ERROR "${scope} option restore: marker validation failed at line ${line_number}"
+			frost_log ERROR "${scope} user option restore: marker validation failed at line ${line_number}"
 			result=1
 			continue
 		fi
@@ -231,14 +231,14 @@ restore_user_options() {
 		else
 			corrupt[i]=true
 			result=1
-			frost_log ERROR "${scope} option restore: ${target} record validation failed (line ${line_number})"
+			frost_log ERROR "${scope} user option restore: ${target} record validation failed (line ${line_number})"
 		fi
 	done < "$save_file"
 
 	[ "${#keys[@]}" -gt 0 ] || return "$result"
 	# Avoid tmux prefix and current-target resolution; use only an exact path match.
 	if ! inventory="$(tmux -u "$inventory_command" -a -F "$inventory_format" 2>/dev/null)"; then
-		frost_log ERROR "${scope} option restore: failed to list target ${scope}s"
+		frost_log ERROR "${scope} user option restore: failed to list target ${scope}s"
 		return 1
 	fi
 	for ((i = 0; i < ${#keys[@]}; i++)); do
@@ -246,7 +246,7 @@ restore_user_options() {
 		target="${current_session}:${current_window}"
 		[ "$scope" != pane ] || target="${target}.${current_pane}"
 		if [ "${markers[i]}" = false ]; then
-			frost_log WARN "${scope} option restore: ignoring ${target} record without a valid marker"
+			frost_log WARN "${scope} user option restore: ignoring ${target} record without a valid marker"
 			result=1
 			continue
 		fi
@@ -265,11 +265,11 @@ restore_user_options() {
 			fi
 		done <<<"$inventory"
 		if [ -z "$target_id" ]; then
-			frost_log WARN "${scope} option restore: no target ${scope} for ${target} (orphan thaw)"
+			frost_log WARN "${scope} user option restore: no target ${scope} for ${target} (orphan thaw)"
 			continue
 		fi
 		if ! names="$(list_user_option_names "$target_id" "$option_scope" 2>/dev/null)"; then
-			frost_log ERROR "${scope} option restore: failed to list local names for ${target}"
+			frost_log ERROR "${scope} user option restore: failed to list local names for ${target}"
 			result=1
 			continue
 		fi
@@ -284,7 +284,7 @@ restore_user_options() {
 			current_names[${#current_names[@]}]="$name"
 		done <<<"$names"
 		if [ "$valid" = false ]; then
-			frost_log ERROR "${scope} option restore: failed to decode local names for ${target}"
+			frost_log ERROR "${scope} user option restore: failed to decode local names for ${target}"
 			result=1
 			continue
 		fi
@@ -293,7 +293,7 @@ restore_user_options() {
 		for name in "${current_names[@]}"; do
 			prepare_tmux_option_name "$name" escaped_name
 			if ! tmux -u set-option "-u${option_scope}" -t "$escaped_target" "$escaped_name" 2>/dev/null; then
-				frost_log ERROR "${scope} option restore: failed to delete local options for ${target}"
+				frost_log ERROR "${scope} user option restore: failed to delete local options for ${target}"
 				result=1
 				valid=false
 				break
@@ -305,7 +305,7 @@ restore_user_options() {
 			prepare_tmux_option_name "${saved_names[j]}" escaped_name
 			escape_tmux_argument "${saved_values[j]}" escaped_value
 			if ! tmux -u set-option "-${option_scope}" -t "$escaped_target" "$escaped_name" "$escaped_value" 2>/dev/null; then
-				frost_log ERROR "${scope} option restore: failed to set saved options for ${target}"
+				frost_log ERROR "${scope} user option restore: failed to set saved options for ${target}"
 				result=1
 			fi
 		done
@@ -322,7 +322,7 @@ restore_window_properties() {
 		# Apply layout
 		tmux select-layout -t "${session_name}:${window_number}" "$window_layout" 2>/dev/null
 
-		# Restore window name
+		# Restore tmux's built-in window name.
 		window_name="$(remove_first_char "$window_name")"
 		tmux rename-window -t "${session_name}:${window_number}" "$window_name" 2>/dev/null
 
@@ -423,8 +423,8 @@ main() {
 	restore_state "$actual_file"
 
 	if [ "$option_status" -ne 0 ]; then
-		frost_log ERROR 'partial thaw restore: failed to restore some window or pane options'
-		display_message 'Glacier: some window or pane options could not be restored; check the logs'
+		frost_log ERROR 'partial thaw restore: failed to restore some window or pane user options'
+		display_message 'Glacier: some window or pane user options could not be restored; check the logs'
 		return 1
 	fi
 
